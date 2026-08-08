@@ -1,0 +1,12 @@
+/target/
+
+# Per-run measurements; only the aggregated summaries in results/ are tracked.
+/results/raw/
+/fixtures/out/
+
+# Local MCP wiring, created from .cursor/mcp.json.example.
+/.cursor/mcp.json
+
+*.swp
+.env
+.DS_Store

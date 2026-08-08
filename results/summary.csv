@@ -1,0 +1,3 @@
+backend,scale,ablation,seed,cold,ingest_ms,churn_ratio,pass_rate,false_allow,false_block,schema_loc,rust_loc,avg_p50_us,avg_p95_us
+postgres,S,none,42,true,3864,1.00,0.8889,0,0,129,1036,3128,5043
+typedb,S,none,42,true,9978,1.00,0.8311,0,0,133,1257,13889,23287

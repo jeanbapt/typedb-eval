@@ -1,0 +1,69 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: benchmark
+      POSTGRES_PASSWORD: benchmark
+      POSTGRES_DB: benchmark
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U benchmark -d benchmark"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  typedb:
+    image: typedb/typedb:3.12.1
+    ports:
+      - "1729:1729"
+    volumes:
+      - typedbdata:/opt/typedb-all/data
+    # TypeDB CE image has no curl/wget; readiness is checked by typedb-mcp on connect.
+
+  typedb-mcp:
+    # 1.0.0 is the last tag published with a linux/arm64 manifest; 1.0.1+ are amd64-only.
+    # Staying here keeps the agent-retrieval latencies native instead of emulated.
+    image: typedb/typedb-mcp:1.0.0
+    ports:
+      - "8001:8001"
+    command:
+      - "--typedb-address"
+      - "http://typedb:1729"
+      - "--typedb-username"
+      - "admin"
+      - "--typedb-password"
+      - "password"
+    depends_on:
+      typedb:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || curl -sf http://localhost:8001/mcp || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  postgres-mcp:
+    build: ./services/postgres-mcp
+    ports:
+      - "8899:8899"
+    environment:
+      DATABASE_URL: postgresql://benchmark:benchmark@postgres:5432/benchmark
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: "8899"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8899/mcp')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  pgdata:
+  typedbdata:

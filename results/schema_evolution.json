@@ -1,0 +1,99 @@
+{
+  "scale": "S",
+  "seed": 42,
+  "backends": [
+    {
+      "backend": "postgres",
+      "base": {
+        "generation": "base",
+        "expected_edges": 74,
+        "found_edges": 74,
+        "expected_relation_types": [
+          "ownership"
+        ],
+        "found_relation_types": [
+          "ownership"
+        ],
+        "exact_probes": 50,
+        "total_probes": 50
+      },
+      "extended_frozen": {
+        "generation": "extended",
+        "expected_edges": 258,
+        "found_edges": 74,
+        "expected_relation_types": [
+          "control-via-nominee",
+          "ownership"
+        ],
+        "found_relation_types": [
+          "ownership"
+        ],
+        "exact_probes": 0,
+        "total_probes": 50
+      },
+      "extended_repaired": {
+        "generation": "extended",
+        "expected_edges": 258,
+        "found_edges": 258,
+        "expected_relation_types": [
+          "control-via-nominee",
+          "ownership"
+        ],
+        "found_relation_types": [
+          "control-via-nominee",
+          "ownership"
+        ],
+        "exact_probes": 50,
+        "total_probes": 50
+      },
+      "repair_loc": 20
+    },
+    {
+      "backend": "typedb",
+      "base": {
+        "generation": "base",
+        "expected_edges": 74,
+        "found_edges": 74,
+        "expected_relation_types": [
+          "ownership"
+        ],
+        "found_relation_types": [
+          "ownership"
+        ],
+        "exact_probes": 50,
+        "total_probes": 50
+      },
+      "extended_frozen": {
+        "generation": "extended",
+        "expected_edges": 258,
+        "found_edges": 258,
+        "expected_relation_types": [
+          "control-via-nominee",
+          "ownership"
+        ],
+        "found_relation_types": [
+          "control-via-nominee",
+          "ownership"
+        ],
+        "exact_probes": 50,
+        "total_probes": 50
+      },
+      "extended_repaired": {
+        "generation": "extended",
+        "expected_edges": 258,
+        "found_edges": 258,
+        "expected_relation_types": [
+          "control-via-nominee",
+          "ownership"
+        ],
+        "found_relation_types": [
+          "control-via-nominee",
+          "ownership"
+        ],
+        "exact_probes": 50,
+        "total_probes": 50
+      },
+      "repair_loc": 0
+    }
+  ]
+}

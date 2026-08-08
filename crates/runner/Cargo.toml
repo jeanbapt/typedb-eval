@@ -1,0 +1,25 @@
+[package]
+name = "benchmark-runner"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "runner"
+path = "src/main.rs"
+
+[dependencies]
+benchmark-core = { workspace = true }
+benchmark-fixtures = { workspace = true }
+benchmark-postgres = { workspace = true }
+benchmark-typedb = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+csv = { workspace = true }
+hdrhistogram = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }

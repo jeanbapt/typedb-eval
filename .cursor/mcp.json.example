@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "typedb-mcp": {
+      "url": "http://localhost:8001/mcp"
+    },
+    "postgres-mcp": {
+      "url": "http://localhost:8899/mcp"
+    }
+  }
+}

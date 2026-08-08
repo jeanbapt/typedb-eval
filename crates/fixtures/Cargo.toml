@@ -1,0 +1,13 @@
+[package]
+name = "benchmark-fixtures"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+benchmark-core = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

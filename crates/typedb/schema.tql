@@ -1,0 +1,145 @@
+define
+
+attribute entity-id, value string;
+attribute person-name, value string;
+attribute canonical-name, value string;
+attribute company-name, value string;
+attribute jurisdiction-code, value string;
+attribute share-pct, value double;
+attribute evidence-state, value string;
+attribute governance-level, value string;
+attribute context-type, value string;
+attribute role-type, value string;
+attribute source-id, value string;
+attribute source-authority, value double;
+attribute predicate-name, value string;
+attribute list-name, value string;
+attribute listed-flag, value boolean;
+attribute rule-id, value string;
+attribute threshold-pct, value double;
+attribute valid-from, value datetime;
+attribute valid-to, value datetime;
+attribute known-from, value datetime;
+attribute known-to, value datetime;
+attribute observed-at, value datetime;
+attribute alias-text, value string;
+attribute merge-flag, value boolean;
+
+attribute trust-name, value string;
+
+entity person,
+    owns entity-id @key,
+    owns person-name,
+    owns canonical-name,
+    owns jurisdiction-code,
+    plays ownership:owner,
+    plays identity-link:linked-person,
+    plays sanction-listing:sanctioned-person,
+    plays generic-assertion:subject,
+    plays control-via-nominee:controller,
+    plays control-via-nominee:nominee;
+
+entity company,
+    owns entity-id @key,
+    owns company-name,
+    owns jurisdiction-code,
+    plays ownership:owner,
+    plays ownership:owned,
+    plays generic-assertion:object,
+    plays control-via-nominee:controller,
+    plays control-via-nominee:controlled;
+
+# Ontology extension: a third party kind. Declaring it able to fill an existing role is a
+# one-line schema statement; no table, no discriminator column, no foreign-key exception.
+entity trust,
+    owns entity-id @key,
+    owns trust-name,
+    owns jurisdiction-code,
+    plays control-via-nominee:controller,
+    plays control-via-nominee:instrument;
+
+relation ownership,
+    relates owner,
+    relates owned,
+    owns share-pct,
+    owns evidence-state,
+    owns governance-level,
+    owns context-type,
+    owns role-type,
+    owns jurisdiction-code,
+    owns source-id,
+    owns source-authority,
+    owns valid-from,
+    owns valid-to,
+    owns known-from,
+    owns known-to,
+    owns observed-at;
+
+relation identity-link,
+    relates linked-person,
+    owns alias-text,
+    owns canonical-name,
+    owns merge-flag,
+    owns context-type,
+    owns observed-at;
+
+relation sanction-listing,
+    relates sanctioned-person,
+    owns list-name,
+    owns listed-flag,
+    owns context-type,
+    owns valid-from,
+    owns valid-to,
+    owns known-from,
+    owns known-to;
+
+relation generic-assertion,
+    relates subject,
+    relates object,
+    owns predicate-name,
+    owns evidence-state,
+    owns governance-level,
+    owns context-type,
+    owns jurisdiction-code,
+    owns source-id,
+    owns source-authority,
+    owns valid-from,
+    owns valid-to,
+    owns known-from,
+    owns known-to,
+    owns observed-at;
+
+# Ontology extension: genuinely 4-ary, with a polymorphic `controller` role fillable by
+# person, company or trust.
+relation control-via-nominee,
+    relates controller,
+    relates controlled,
+    relates nominee,
+    relates instrument,
+    owns context-type,
+    owns jurisdiction-code,
+    owns source-id,
+    owns source-authority,
+    owns valid-from,
+    owns valid-to,
+    owns known-from,
+    owns known-to,
+    owns observed-at;
+
+entity compliance-rule,
+    owns rule-id @key,
+    owns threshold-pct;
+
+# Recursive transitive owners (left-recursive, tabling-safe per TypeDB docs).
+# Bitemporal filters are applied at the call site in match pipelines.
+fun transitive-owner-persons($target: company) -> { person }:
+    match
+        {
+            $o isa ownership, links (owner: $p, owned: $target);
+            $p isa person;
+        } or {
+            $o isa ownership, links (owner: $mid, owned: $target);
+            $mid isa company;
+            let $p in transitive-owner-persons($mid);
+        };
+    return { $p };
