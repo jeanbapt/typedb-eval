@@ -12,6 +12,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+authors = ["Deal ex Machina SAS"]
 
 [workspace.dependencies]
 benchmark-core = { path = "crates/core" }

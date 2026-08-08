@@ -251,7 +251,9 @@ Voir [results/DECISION.md](results/DECISION.md) après exécution du benchmark. 
 
 ## Licence
 
-MIT — voir le dépôt pour les détails.
+MIT — voir [LICENSE](LICENSE).
+
+Copyright (c) 2026 Deal ex Machina SAS.
 
 ## Liens
 
