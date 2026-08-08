@@ -103,7 +103,8 @@ pub async fn run_benchmark(
         }
     }
 
-    let signal = detect_signal(&all_metrics);
+    let schema_evolution = crate::signal::load_schema_evolution_signal(out);
+    let signal = crate::signal::detect_signal_with(&all_metrics, schema_evolution.as_ref());
     write_decision_md(out, &all_metrics, &signal)?;
 
     Ok(())

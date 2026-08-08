@@ -36,6 +36,7 @@ entity person,
     plays identity-link:linked-person,
     plays sanction-listing:sanctioned-person,
     plays generic-assertion:subject,
+    plays generic-assertion:object,
     plays control-via-nominee:controller,
     plays control-via-nominee:nominee;
 
@@ -45,6 +46,7 @@ entity company,
     owns jurisdiction-code,
     plays ownership:owner,
     plays ownership:owned,
+    plays generic-assertion:subject,
     plays generic-assertion:object,
     plays control-via-nominee:controller,
     plays control-via-nominee:controlled;

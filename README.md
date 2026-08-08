@@ -24,6 +24,29 @@ Un gain marginal (15–30 %) ne justifie pas une nouvelle technologie de persist
 
 ---
 
+## Pourquoi TypeDB méritait l'épreuve
+
+Qu'est-ce qui justifierait de renoncer à PostgreSQL — trente ans de maturité, d'outillage, et d'exploitants capables de le réparer à trois heures du matin ? Une seule chose : une inadéquation structurelle entre le modèle de données et le problème posé. TypeDB rendait cette hypothèse plausible.
+
+Le modèle PERA (*Polymorphic Entity-Relation-Attribute*) déplace une frontière. Dans le monde relationnel, une relation se réduit à une clé étrangère : un artefact de stockage que l'application doit réinterpréter à chaque lecture. Dans TypeDB, elle constitue un type de premier rang, doté de rôles nommés, d'une arité quelconque, et susceptible de participer elle-même à d'autres relations. Le schéma cesse d'être un plan de rangement pour devenir une ontologie.
+
+Quatre propriétés, en particulier, épousaient les besoins de SGRS :
+
+- **Rôles polymorphes.** Un rôle `owner` peut être tenu par une personne, une société, un trust ou un fonds souverain — déclaré une fois, vérifié par le schéma. SQL ignore la notion de supertype : on hérite d'une colonne discriminante et d'une clé étrangère qu'il faut abandonner.
+- **Traversée agnostique aux rôles.** Interroger « tout ce à quoi cette entité participe » tient en une ligne de TypeQL. La même question exige en SQL une `UNION` sur chaque table concernée, réécrite à chaque enrichissement de l'ontologie.
+- **Récursion déclarée dans le schéma.** Les fonctions TypeQL portent la logique transitive une fois pour toutes, là où le CTE récursif se recopie de requête en requête.
+- **Invariants typés.** Qui peut tenir quel rôle, dans quelle relation : autant de garanties qui relèvent du schéma plutôt que de la discipline applicative.
+
+Pour un substrat dont la vocation est de représenter des états sémantiques gouvernés, l'argument porte. SGRS maintient une ontologie vivante, appelée à s'enrichir sans relâche — nouveaux types de parties, nouvelles formes de contrôle, nouvelles juridictions. Or le coût d'une ontologie se paie à chaque extension, bien davantage qu'à sa rédaction initiale.
+
+Reste que l'élégance conceptuelle constitue un piège classique. Un modèle qui se lit bien peut coûter trois fois la latence, renoncer à la bitemporalité native, et rendre au code applicatif ce qu'il prétendait absorber. Trois questions demandaient donc à être tranchées. La promesse survit-elle à la mesure ? Le confort de modélisation se paie-t-il en performance ? Et l'avantage subsiste-t-il face à un PostgreSQL correctement modélisé, plutôt que naïvement ?
+
+D'où ce dépôt. L'expérience d'évolution de schéma (Q9, voir plus bas) opérationnalise directement la deuxième promesse : une requête écrite contre l'ontologie de base, gelée, puis rejouée après extension. Ce que chaque backend cesse de voir se mesure alors en rappel perdu et en lignes de requête à réécrire.
+
+Une technologie séduisante exige la mesure avant l'adoption.
+
+---
+
 ## Ce que contient ce dépôt
 
 Un prototype minimal, volontairement resserré :
@@ -36,7 +59,7 @@ Un prototype minimal, volontairement resserré :
 | `crates/typedb` | Schéma TypeQL + implémentation TypeDB 3.12 |
 | `crates/runner` | CLI benchmark, métriques, ablation, export |
 | `results/` | Mesures brutes + `summary.csv` |
-| `DECISION.md` | Verdict final (`KEEP POSTGRES` / `INVESTIGATE HYBRID` / `PURSUE TYPEDB`) |
+| `results/DECISION.md` | Verdict final (`KEEP POSTGRES` / `INVESTIGATE HYBRID` / `PURSUE TYPEDB` / `INCONCLUSIVE`) |
 
 **Domaine métier du benchmark** : scénario simplifié KYB / sanctions / beneficial ownership. Ce n'est pas une implémentation réglementaire — c'est un générateur de problèmes structurels représentatifs (ownership indirect, identité incertaine, sources contradictoires, corrections rétroactives, etc.).
 
@@ -112,6 +135,9 @@ cargo run -p benchmark-runner -- \
 # Ablation complète (toutes les dimensions)
 cargo run -p benchmark-runner -- ablation --backend both --scale M --seed 42 --out results/
 
+# Régénérer summary.csv et DECISION.md depuis results/raw/ sans relancer le benchmark
+cargo run -p benchmark-runner -- report --out results/
+
 # Tests unitaires
 cargo test
 ```
@@ -130,6 +156,26 @@ cargo test
 | Q6 | Les contextes Corporate Registry / KYC / Sanctions sont-ils compatibles ? |
 | Q7 | Avec les infos connues à une date, la décision aurait-elle été ALLOW / REVIEW / BLOCK ? |
 | Q8 | Avec les infos d'aujourd'hui, comment qualifier la même situation passée ? (Q7 ≠ Q8) |
+| Q9 | À quoi cette entité participe-t-elle, quel que soit le type de relation ou le rôle tenu ? |
+
+---
+
+## Évolution de schéma (Q9)
+
+Q9 mesure la propriété la plus difficile à obtenir en SQL : interroger les relations d'une entité sans énumérer les types de relations.
+
+Le protocole tient en trois temps. Chaque backend implémente Q9 une fois, contre l'ontologie de base. L'ontologie gagne ensuite un type de partie (`trust`) et une relation 4-aire à rôle polymorphe (`control-via-nominee`, dont le `controller` peut être une personne, une société ou un trust). La requête initiale, inchangée, est enfin rejouée.
+
+Les deux backends paient un coût de schéma. Un seul paie un coût de requête.
+
+```bash
+cargo run -p benchmark-runner -- schema-evolution --backend both --scale S --seed 42 --out results/
+```
+
+Deux mesures en sortent, dans `results/SCHEMA_EVOLUTION.md` :
+
+- **rappel après extension** — la fraction des relations réelles que la requête gelée retourne encore. En deçà de 100 %, le backend sous-déclare silencieusement après une évolution d'ontologie, ce qui relève de la correction plutôt que de la performance ;
+- **LOC de réparation** — le volume de requête à écrire pour revenir à 100 %.
 
 ---
 
@@ -141,7 +187,9 @@ cargo test
 | **M** | 20 000 | Run décisionnel principal |
 | **L** | 200 000 | Conditionnel — seulement si M montre un signal ≥2× |
 
-Après M, si aucun avantage TypeDB significatif n'est détecté, le benchmark s'arrête et produit `DECISION.md` avec verdict **KEEP POSTGRES**. C'est un résultat valide et attendu.
+Après M, si aucun avantage TypeDB significatif n'est détecté, le benchmark s'arrête et produit `results/DECISION.md` avec verdict **KEEP POSTGRES**. C'est un résultat valide et attendu.
+
+Un verdict comparatif exige que les deux backends aient terminé. Si un seul a tourné, le document porte la mention **INCONCLUSIVE** plutôt qu'une conclusion tirée d'une moitié de mesure.
 
 ---
 
@@ -151,6 +199,7 @@ Après M, si aucun avantage TypeDB significatif n'est détecté, le benchmark s'
 - **Correctness** : comparaison systématique vs oracle (false allow/block/review, false merge/split, missed contradiction)
 - **Semantic churn** : `physical_mutations / semantic_changes`
 - **Complexité** : LOC schéma, LOC requêtes, LOC backend Rust, nombre d'objets DB
+- **Évolution de schéma** : rappel conservé par une requête gelée après extension de l'ontologie, LOC de réparation
 - **Ablation** : impact de chaque dimension sémantique (identity, evidence, valid_time, knowledge_time, jurisdiction, role, source, provenance, governance…)
 
 Résultats dans `results/summary.csv` et `results/raw/*.json`.
@@ -188,14 +237,15 @@ Pour Cursor, copier [`.cursor/mcp.json.example`](.cursor/mcp.json.example) vers 
 
 ## Verdict
 
-Voir [DECISION.md](DECISION.md) après exécution du benchmark. Le document couvre :
+Voir [results/DECISION.md](results/DECISION.md) après exécution du benchmark. Le document couvre :
 
 1. Hypothèse testée
 2. Périmètre
 3. Résultats
-4. Où TypeDB gagne / où PostgreSQL gagne
-5. Coût architectural de TypeDB
-6. Verdict explicite
+4. Évolution de schéma (churn de la surface de requête)
+5. Où TypeDB gagne / où PostgreSQL gagne
+6. Coût architectural de TypeDB
+7. Verdict explicite
 
 ---
 

@@ -1,3 +1,5 @@
-backend,scale,ablation,seed,cold,ingest_ms,churn_ratio,pass_rate,false_allow,false_block,schema_loc,rust_loc,avg_p50_us,avg_p95_us
-postgres,S,none,42,true,3864,1.00,0.8889,0,0,129,1036,3128,5043
-typedb,S,none,42,true,9978,1.00,0.8311,0,0,133,1257,13889,23287
+backend,scale,ablation,seed,cold,ingest_ms,churn_ratio,pass_rate,false_allow,false_block,missed_relations,schema_loc,rust_loc,avg_p50_us,avg_p95_us
+postgres,M,none,42,true,38530,1.00,0.8822,0,0,0,129,1036,9684,16835
+postgres,S,none,42,true,1501,1.00,0.8889,0,0,0,129,1036,1889,2950
+typedb,M,none,42,true,178914,1.00,0.8844,0,0,0,135,1257,27161,38515
+typedb,S,none,42,true,4065,1.00,0.8311,0,0,0,135,1257,7681,10084

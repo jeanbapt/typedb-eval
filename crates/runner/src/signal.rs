@@ -8,9 +8,47 @@ pub struct SignalReport {
     pub rationale: String,
 }
 
+/// Summary of the schema-evolution experiment, when it has been run.
+pub struct SchemaEvolutionSignal {
+    /// Backends whose frozen Q9 lost recall after the ontology was extended.
+    pub lost_recall: Vec<(String, f64, u64)>,
+    /// Backends whose frozen Q9 kept full recall with no query edit.
+    pub held_recall: Vec<String>,
+}
+
+pub fn load_schema_evolution_signal(out: &std::path::Path) -> Option<SchemaEvolutionSignal> {
+    let raw = std::fs::read_to_string(out.join("schema_evolution.json")).ok()?;
+    let report: crate::schema_evolution::SchemaEvolutionReport =
+        serde_json::from_str(&raw).ok()?;
+
+    let mut lost_recall = Vec::new();
+    let mut held_recall = Vec::new();
+    for b in &report.backends {
+        let recall = b.extended_frozen.recall();
+        if recall < 0.999 || b.repair_loc > 0 {
+            lost_recall.push((b.backend.clone(), recall, b.repair_loc));
+        } else {
+            held_recall.push(b.backend.clone());
+        }
+    }
+    Some(SchemaEvolutionSignal {
+        lost_recall,
+        held_recall,
+    })
+}
+
 pub fn detect_signal(metrics: &[BenchmarkMetrics]) -> SignalReport {
-    let pg = metrics.iter().find(|m| m.backend == "postgres" && m.ablation == "none");
-    let tdb = metrics.iter().find(|m| m.backend == "typedb" && m.ablation == "none");
+    detect_signal_with(metrics, None)
+}
+
+pub fn detect_signal_with(
+    metrics: &[BenchmarkMetrics],
+    schema_evolution: Option<&SchemaEvolutionSignal>,
+) -> SignalReport {
+    // Compare at the largest scale each backend completed, not at whichever row happens to
+    // come first: a verdict drawn from the S run would not be the decisional one.
+    let pg = crate::export::largest_scale(metrics, "postgres");
+    let tdb = crate::export::largest_scale(metrics, "typedb");
 
     let mut should_run_l = false;
     let mut typedb_wins = Vec::new();
@@ -65,13 +103,19 @@ pub fn detect_signal(metrics: &[BenchmarkMetrics]) -> SignalReport {
                 tdb.correctness.pass_rate() * 100.0,
                 pg.correctness.pass_rate() * 100.0
             ));
-        } else if pg.correctness.pass_rate() >= tdb.correctness.pass_rate() {
-            pg_wins.push(format!(
-                "Correctness: PostgreSQL pass rate {:.1}% vs TypeDB {:.1}%",
-                pg.correctness.pass_rate() * 100.0,
-                tdb.correctness.pass_rate() * 100.0
-            ));
-        }
+            } else if pg.correctness.pass_rate() > tdb.correctness.pass_rate() + 0.05 {
+                pg_wins.push(format!(
+                    "Correctness: PostgreSQL pass rate {:.1}% vs TypeDB {:.1}%",
+                    pg.correctness.pass_rate() * 100.0,
+                    tdb.correctness.pass_rate() * 100.0
+                ));
+            } else {
+                pg_wins.push(format!(
+                    "Correctness: comparable (PG {:.1}%, TDB {:.1}%) — no structural advantage",
+                    pg.correctness.pass_rate() * 100.0,
+                    tdb.correctness.pass_rate() * 100.0
+                ));
+            }
 
         // Churn
         if pg.churn.ratio > tdb.churn.ratio * 1.5 {
@@ -95,7 +139,38 @@ pub fn detect_signal(metrics: &[BenchmarkMetrics]) -> SignalReport {
         pg_wins.push("Only one backend ran successfully".into());
     }
 
-    let verdict = determine_verdict(&typedb_wins, &pg_wins, should_run_l);
+    // Schema evolution: independent of scale, so it is folded in whenever available.
+    if let Some(se) = schema_evolution {
+        for (backend, recall, repair_loc) in &se.lost_recall {
+            let line = format!(
+                "Schema evolution: {backend} silently drops to {:.1}% recall after an ontology \
+                 extension and needs {repair_loc} LOC of query repair",
+                recall * 100.0
+            );
+            if backend == "postgres" {
+                typedb_wins.push(line);
+            } else {
+                pg_wins.push(line);
+            }
+        }
+        if se.held_recall.iter().any(|b| b == "typedb") && !se.lost_recall.is_empty() {
+            typedb_wins.push(
+                "Schema evolution: TypeDB keeps 100% recall through the extension with zero \
+                 query edits (role-agnostic traversal)"
+                    .into(),
+            );
+        }
+    }
+
+    let both_backends_ran = metrics.iter().any(|m| m.backend == "postgres")
+        && metrics.iter().any(|m| m.backend == "typedb");
+
+    let verdict = if both_backends_ran {
+        determine_verdict(&typedb_wins, &pg_wins, should_run_l)
+    } else {
+        // A comparative verdict from a single backend is not a verdict.
+        "INCONCLUSIVE".into()
+    };
     let rationale = build_rationale(&verdict, &typedb_wins, &pg_wins);
 
     SignalReport {

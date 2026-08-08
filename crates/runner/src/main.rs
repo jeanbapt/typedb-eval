@@ -84,6 +84,11 @@ enum Commands {
         #[arg(long, default_value = "results")]
         out: PathBuf,
     },
+    /// Rebuild summary.csv and DECISION.md from existing raw results
+    Report {
+        #[arg(long, default_value = "results")]
+        out: PathBuf,
+    },
     /// Run agent retrieval benchmark via Postgres + TypeDB MCP servers
     AgentRetrieval {
         #[arg(long, default_value = "S")]
@@ -150,6 +155,16 @@ async fn main() -> anyhow::Result<()> {
         }) => {
             schema_evolution::run_schema_evolution(backend, parse_scale(&scale), seed, &out)
                 .await?;
+        }
+        Some(Commands::Report { out }) => {
+            let metrics = export::load_raw_metrics(&out)?;
+            if metrics.is_empty() {
+                anyhow::bail!("no raw results found in {}", out.join("raw").display());
+            }
+            let se = signal::load_schema_evolution_signal(&out);
+            let report = signal::detect_signal_with(&metrics, se.as_ref());
+            export::write_summary_csv(&out, &metrics)?;
+            export::write_decision_md(&out, &metrics, &report)?;
         }
         Some(Commands::AgentRetrieval {
             scale,
