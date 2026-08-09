@@ -70,6 +70,12 @@ CREATE INDEX IF NOT EXISTS idx_ownership_owned ON ownership_assertion (owned_id)
 CREATE INDEX IF NOT EXISTS idx_ownership_valid ON ownership_assertion USING GIST (valid_range);
 CREATE INDEX IF NOT EXISTS idx_ownership_known ON ownership_assertion USING GIST (known_range);
 
+-- Upgrade databases created before polymorphic ownership (CREATE IF NOT EXISTS is a no-op).
+ALTER TABLE ownership_assertion DROP CONSTRAINT IF EXISTS ownership_assertion_owner_id_fkey;
+ALTER TABLE ownership_assertion ADD COLUMN IF NOT EXISTS owner_kind TEXT;
+UPDATE ownership_assertion SET owner_kind = 'person' WHERE owner_kind IS NULL;
+ALTER TABLE ownership_assertion ALTER COLUMN owner_kind SET NOT NULL;
+
 CREATE TABLE IF NOT EXISTS assertion (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     subject_id       UUID NOT NULL,
