@@ -5,8 +5,9 @@ use typedb_driver::{
 
 use benchmark_core::error::Result;
 use benchmark_core::{
-    AblationDimension, Compatibility, ComplianceStore, Conflict, Decision, EntityId, EntityState,
-    Event, Exposure, IdentityAction, Neighborhood, PersonId, StateDelta, Timestamp,
+    AblationDimension, AssertionId, Bitemporal, Compatibility, ComplianceStore, Conflict, Decision,
+    EntityId, EntityState, Event, Exposure, IdentityAction, Neighborhood, PersonId, StateDelta,
+    Timestamp,
 };
 
 use crate::reads::TypeDbReads;
@@ -160,6 +161,163 @@ impl TypeDbStore {
             driver: &self.driver,
             database: &self.database,
         }
+    }
+
+    async fn retroactive_correct(
+        &self,
+        assertion_id: AssertionId,
+        new_valid_from: Timestamp,
+        corrected_at: Timestamp,
+    ) -> Result<()> {
+        let close = format!(
+            r#"match $r has assertion-id "{id}";
+            update $r has known-to {kt};"#,
+            id = assertion_id.0,
+            kt = Self::dt(corrected_at),
+        );
+        self.run_write(&close).await?;
+
+        let fetch_own = format!(
+            r#"match
+                $old isa ownership, has assertion-id "{id}",
+                    has share-pct $sp, has evidence-state $ev, has governance-level $gov,
+                    has context-type $ctx, has role-type $role, has jurisdiction-code $jur,
+                    has source-id $src, has source-authority $auth, has observed-at $obs;
+                $old links (owner: $owner, owned: $owned);
+                $owner has entity-id $oid;
+                $owned has entity-id $cid;
+            select $sp, $ev, $gov, $ctx, $role, $jur, $src, $auth, $obs, $oid, $cid;"#,
+            id = assertion_id.0,
+        );
+        if let Ok(rows) = self.reads().collect_named_rows(&fetch_own).await {
+            if let Some(row) = rows.first() {
+                let owner = EntityId::from_uuid(uuid::Uuid::parse_str(row.get("oid").unwrap()).unwrap());
+                let owned = EntityId::from_uuid(uuid::Uuid::parse_str(row.get("cid").unwrap()).unwrap());
+                let share_pct: f32 = row.get("sp").and_then(|s| s.parse().ok()).unwrap_or(0.0);
+                let predicate = format!("owns_{share_pct}");
+                let valid_to = row
+                    .get("vt")
+                    .filter(|s| !s.is_empty())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|d| d.with_timezone(&chrono::Utc));
+                let new_bitemporal = Bitemporal {
+                    valid_from: new_valid_from,
+                    valid_to,
+                    known_from: corrected_at,
+                    known_to: None,
+                };
+                let new_id = AssertionId::deterministic(
+                    owner,
+                    &predicate,
+                    owned,
+                    &new_bitemporal,
+                    0,
+                    &format!("retro:{}@{}", assertion_id.0, corrected_at.timestamp()),
+                );
+                let valid_to_clause = valid_to
+                    .map(|t| format!(", has valid-to {}", Self::dt(t)))
+                    .unwrap_or_default();
+                let insert = format!(
+                    r#"match
+                        {{ $owner isa person, has entity-id "{oid}"; }} or {{ $owner isa company, has entity-id "{oid}"; }};
+                        $owned isa company, has entity-id "{cid}";
+                    insert
+                        (owner: $owner, owned: $owned) isa ownership,
+                        has assertion-id "{new_id}",
+                        has share-pct {share_pct},
+                        has evidence-state "{ev}",
+                        has governance-level "{gov}",
+                        has context-type "{ctx}",
+                        has role-type "{role}",
+                        has jurisdiction-code "{jur}",
+                        has source-id "{src}",
+                        has source-authority {auth},
+                        has observed-at {obs},
+                        has valid-from {vf},
+                        has known-from {kf}{valid_to_clause};"#,
+                    oid = owner.0,
+                    cid = owned.0,
+                    new_id = new_id.0,
+                    share_pct = share_pct,
+                    ev = row.get("ev").cloned().unwrap_or_default(),
+                    gov = row.get("gov").cloned().unwrap_or_default(),
+                    ctx = row.get("ctx").cloned().unwrap_or_default(),
+                    role = row.get("role").cloned().unwrap_or_default(),
+                    jur = row.get("jur").cloned().unwrap_or_default(),
+                    src = row.get("src").cloned().unwrap_or_default(),
+                    auth = row.get("auth").cloned().unwrap_or_default(),
+                    obs = row.get("obs").cloned().unwrap_or_default(),
+                    vf = Self::dt(new_valid_from),
+                    kf = Self::dt(corrected_at),
+                    valid_to_clause = valid_to_clause,
+                );
+                return self.run_write(&insert).await;
+            }
+        }
+
+        let fetch_gen = format!(
+            r#"match
+                $old isa generic-assertion, has assertion-id "{id}",
+                    has predicate-name $pred, has evidence-state $ev, has context-type $ctx,
+                    has source-id $src, has source-authority $auth, has observed-at $obs;
+                $old links (subject: $s, object: $o);
+                $s has entity-id $sid;
+                $o has entity-id $oid;
+            select $pred, $ev, $ctx, $src, $auth, $obs, $sid, $oid;"#,
+            id = assertion_id.0,
+        );
+        if let Ok(rows) = self.reads().collect_named_rows(&fetch_gen).await {
+            if let Some(row) = rows.first() {
+                let subject = EntityId::from_uuid(uuid::Uuid::parse_str(row.get("sid").unwrap()).unwrap());
+                let object = EntityId::from_uuid(uuid::Uuid::parse_str(row.get("oid").unwrap()).unwrap());
+                let predicate = row.get("pred").cloned().unwrap_or_default();
+                let new_bitemporal = Bitemporal {
+                    valid_from: new_valid_from,
+                    valid_to: None,
+                    known_from: corrected_at,
+                    known_to: None,
+                };
+                let new_id = AssertionId::deterministic(
+                    subject,
+                    &predicate,
+                    object,
+                    &new_bitemporal,
+                    0,
+                    &format!("retro:{}@{}", assertion_id.0, corrected_at.timestamp()),
+                );
+                let insert = format!(
+                    r#"match
+                        {{ $s isa person, has entity-id "{sid}"; }} or {{ $s isa company, has entity-id "{sid}"; }};
+                        {{ $o isa person, has entity-id "{oid}"; }} or {{ $o isa company, has entity-id "{oid}"; }};
+                    insert
+                        (subject: $s, object: $o) isa generic-assertion,
+                        has assertion-id "{new_id}",
+                        has predicate-name "{pred}",
+                        has evidence-state "{ev}",
+                        has context-type "{ctx}",
+                        has source-id "{src}",
+                        has source-authority {auth},
+                        has observed-at {obs},
+                        has valid-from {vf},
+                        has known-from {kf},
+                        has jurisdiction-code "GLOBAL",
+                        has governance-level "OBSERVED";"#,
+                    sid = subject.0,
+                    oid = object.0,
+                    new_id = new_id.0,
+                    pred = predicate.replace('"', ""),
+                    ev = row.get("ev").cloned().unwrap_or_default(),
+                    ctx = row.get("ctx").cloned().unwrap_or_default(),
+                    src = row.get("src").cloned().unwrap_or_default(),
+                    auth = row.get("auth").cloned().unwrap_or_default(),
+                    obs = row.get("obs").cloned().unwrap_or_default(),
+                    vf = Self::dt(new_valid_from),
+                    kf = Self::dt(corrected_at),
+                );
+                return self.run_write(&insert).await;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -327,12 +485,21 @@ impl TypeDbStore {
                     .known_to
                     .map(|t| format!(r#", has known-to {}"#, Self::dt(t)))
                     .unwrap_or_default();
+                let assertion_id = AssertionId::deterministic(
+                    owner.entity(),
+                    &format!("owns_{share_pct}"),
+                    owned.entity(),
+                    &bitemporal,
+                    0,
+                    &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                );
                 let q = format!(
                     r#"match
                         {owner_match}
                         $owned isa company, has entity-id "{owned_id}";
                     insert
                         (owner: $owner, owned: $owned) isa ownership,
+                        has assertion-id "{assertion_id}",
                         has share-pct {share_pct},
                         has evidence-state "{evidence}",
                         has governance-level "{governance}",
@@ -346,6 +513,7 @@ impl TypeDbStore {
                         has observed-at {observed};"#,
                     owner_match = Self::party_match(owner),
                     owned_id = owned.0,
+                    assertion_id = assertion_id.0,
                     share_pct = share_pct,
                     evidence = Self::evidence_str(evidence),
                     governance = Self::governance_str(governance),
@@ -445,13 +613,22 @@ impl TypeDbStore {
                     .known_to
                     .map(|t| format!(r#", has known-to {}"#, Self::dt(t)))
                     .unwrap_or_default();
-                for ev in [supporting, refuting] {
+                for (ev, disc) in [(supporting, 0u32), (refuting, 1u32)] {
+                    let assertion_id = AssertionId::deterministic(
+                        subject,
+                        &predicate,
+                        object,
+                        &bitemporal,
+                        disc,
+                        &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                    );
                     let q = format!(
                         r#"match
                             {{ $s isa person, has entity-id "{subj}"; }} or {{ $s isa company, has entity-id "{subj}"; }};
                             {{ $o isa person, has entity-id "{obj}"; }} or {{ $o isa company, has entity-id "{obj}"; }};
                         insert
                             (subject: $s, object: $o) isa generic-assertion,
+                            has assertion-id "{assertion_id}",
                             has predicate-name "{pred}",
                             has evidence-state "{evidence}",
                             has context-type "{context}",
@@ -464,6 +641,7 @@ impl TypeDbStore {
                             has governance-level "OBSERVED";"#,
                         subj = subject.0,
                         obj = object.0,
+                        assertion_id = assertion_id.0,
                         pred = predicate.replace('"', ""),
                         evidence = Self::evidence_str(ev),
                         context = Self::context_str(context),
@@ -488,7 +666,6 @@ impl TypeDbStore {
                 context,
                 provenance,
                 bitemporal,
-                ..
             } => {
                 let valid_to = bitemporal
                     .valid_to
@@ -498,36 +675,86 @@ impl TypeDbStore {
                     .known_to
                     .map(|t| format!(r#", has known-to {}"#, Self::dt(t)))
                     .unwrap_or_default();
-                let q = format!(
-                    r#"match
-                        {{ $s isa person, has entity-id "{subj}"; }} or {{ $s isa company, has entity-id "{subj}"; }};
-                        {{ $o isa person, has entity-id "{obj}"; }} or {{ $o isa company, has entity-id "{obj}"; }};
-                    insert
-                        (subject: $s, object: $o) isa generic-assertion,
-                        has predicate-name "{pred}",
-                        has evidence-state "{evidence}",
-                        has context-type "{context}",
-                        has source-id "{source}",
-                        has source-authority {auth},
-                        has valid-from {vf}{valid_to},
-                        has known-from {kf}{known_to},
-                        has observed-at {obs},
-                        has jurisdiction-code "GLOBAL",
-                        has governance-level "OBSERVED";"#,
-                    subj = subject.0,
-                    obj = object.0,
-                    pred = predicate.replace('"', ""),
-                    evidence = Self::evidence_str(evidence),
-                    context = Self::context_str(context),
-                    source = provenance.source_id.replace('"', ""),
-                    auth = provenance.source_authority,
-                    vf = Self::dt(bitemporal.valid_from),
-                    valid_to = valid_to,
-                    kf = Self::dt(bitemporal.known_from),
-                    known_to = known_to,
-                    obs = Self::dt(provenance.observed_at),
+                let assertion_id = AssertionId::deterministic(
+                    subject,
+                    &predicate,
+                    object,
+                    &bitemporal,
+                    1,
+                    &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
                 );
-                self.run_write(&q).await?;
+                if predicate.starts_with("owns_") {
+                    let share_pct: f32 = predicate
+                        .strip_prefix("owns_")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0);
+                    let q = format!(
+                        r#"match
+                            {{ $owner isa person, has entity-id "{subj}"; }} or {{ $owner isa company, has entity-id "{subj}"; }};
+                            $owned isa company, has entity-id "{obj}";
+                        insert
+                            (owner: $owner, owned: $owned) isa ownership,
+                            has assertion-id "{assertion_id}",
+                            has share-pct {share_pct},
+                            has evidence-state "{evidence}",
+                            has governance-level "OBSERVED",
+                            has context-type "{context}",
+                            has role-type "SHAREHOLDER",
+                            has jurisdiction-code "GLOBAL",
+                            has source-id "{source}",
+                            has source-authority {auth},
+                            has valid-from {vf}{valid_to},
+                            has known-from {kf}{known_to},
+                            has observed-at {obs};"#,
+                        subj = subject.0,
+                        obj = object.0,
+                        assertion_id = assertion_id.0,
+                        share_pct = share_pct,
+                        evidence = Self::evidence_str(evidence),
+                        context = Self::context_str(context),
+                        source = provenance.source_id.replace('"', ""),
+                        auth = provenance.source_authority,
+                        vf = Self::dt(bitemporal.valid_from),
+                        valid_to = valid_to,
+                        kf = Self::dt(bitemporal.known_from),
+                        known_to = known_to,
+                        obs = Self::dt(provenance.observed_at),
+                    );
+                    self.run_write(&q).await?;
+                } else {
+                    let q = format!(
+                        r#"match
+                            {{ $s isa person, has entity-id "{subj}"; }} or {{ $s isa company, has entity-id "{subj}"; }};
+                            {{ $o isa person, has entity-id "{obj}"; }} or {{ $o isa company, has entity-id "{obj}"; }};
+                        insert
+                            (subject: $s, object: $o) isa generic-assertion,
+                            has assertion-id "{assertion_id}",
+                            has predicate-name "{pred}",
+                            has evidence-state "{evidence}",
+                            has context-type "{context}",
+                            has source-id "{source}",
+                            has source-authority {auth},
+                            has valid-from {vf}{valid_to},
+                            has known-from {kf}{known_to},
+                            has observed-at {obs},
+                            has jurisdiction-code "GLOBAL",
+                            has governance-level "OBSERVED";"#,
+                        subj = subject.0,
+                        obj = object.0,
+                        assertion_id = assertion_id.0,
+                        pred = predicate.replace('"', ""),
+                        evidence = Self::evidence_str(evidence),
+                        context = Self::context_str(context),
+                        source = provenance.source_id.replace('"', ""),
+                        auth = provenance.source_authority,
+                        vf = Self::dt(bitemporal.valid_from),
+                        valid_to = valid_to,
+                        kf = Self::dt(bitemporal.known_from),
+                        known_to = known_to,
+                        obs = Self::dt(provenance.observed_at),
+                    );
+                    self.run_write(&q).await?;
+                }
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
             }
@@ -547,7 +774,27 @@ impl TypeDbStore {
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
             }
-            Event::RetroactiveCorrection { .. } | Event::CloseAssertionKnowledge { .. } => {
+            Event::CloseAssertionKnowledge {
+                assertion_id,
+                known_to,
+            } => {
+                let q = format!(
+                    r#"match $r has assertion-id "{id}";
+                    update $r has known-to {kt};"#,
+                    id = assertion_id.0,
+                    kt = Self::dt(known_to),
+                );
+                self.run_write(&q).await?;
+                delta.physical_mutations = 1;
+                delta.semantic_changes = 1;
+            }
+            Event::RetroactiveCorrection {
+                assertion_id,
+                new_valid_from,
+                corrected_at,
+            } => {
+                self.retroactive_correct(assertion_id, new_valid_from, corrected_at)
+                    .await?;
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
             }

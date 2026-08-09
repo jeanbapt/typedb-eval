@@ -520,7 +520,7 @@ fn emit_company_chains(
                 role: Role::Controller,
                 jurisdiction: JURISDICTIONS[target_idx % JURISDICTIONS.len()].into(),
                 provenance: Provenance {
-                    source_id: "registrar".into(),
+                    source_id: format!("registrar:chain:{target_idx}:{hop}"),
                     source_authority: 0.9,
                     observed_at: known_from,
                 },
@@ -554,7 +554,7 @@ fn emit_company_chains(
             role: Role::BeneficialOwner,
             jurisdiction: JURISDICTIONS[target_idx % JURISDICTIONS.len()].into(),
             provenance: Provenance {
-                source_id: "kyc_vendor".into(),
+                source_id: format!("kyc_vendor:chain_top:{target_idx}"),
                 source_authority: 0.88,
                 observed_at: known_from,
             },
@@ -586,18 +586,27 @@ fn emit_knowledge_closure_events(
 
     // CloseAssertionKnowledge on ~20% of ingested assertions.
     for (step, assertion_id) in assertion_ids.iter().enumerate().step_by(5) {
+        let Some(a) = oracle.get_assertion(*assertion_id) else {
+            continue;
+        };
+        // known_to must be strictly after known_from or Postgres range updates fail.
+        let known_to = a.bitemporal.known_from + Duration::days(30 + (step % 60) as i64);
         out.push(Event::CloseAssertionKnowledge {
             assertion_id: *assertion_id,
-            known_to: base_time + Duration::days(280 + step as i64),
+            known_to,
         });
     }
 
     // RetroactiveCorrection referencing real assertion IDs.
     for (step, assertion_id) in assertion_ids.iter().enumerate().step_by(7) {
+        let Some(a) = oracle.get_assertion(*assertion_id) else {
+            continue;
+        };
+        let corrected_at = a.bitemporal.known_from + Duration::days(60 + (step % 90) as i64);
         out.push(Event::RetroactiveCorrection {
             assertion_id: *assertion_id,
             new_valid_from: base_time + Duration::days(10),
-            corrected_at: base_time + Duration::days(400 + step as i64),
+            corrected_at,
         });
     }
 
@@ -844,6 +853,97 @@ mod tests {
         assert_eq!(s.events.len(), 1000);
         let m = generate_fixtures(1, Scale::M);
         assert_eq!(m.events.len(), 20000);
+    }
+
+    #[test]
+    fn postgres_bound_assertion_ids_are_unique() {
+        use std::collections::HashSet;
+
+        use benchmark_core::{AssertionId, Bitemporal, Event};
+
+        let bundle = generate_fixtures(42, Scale::S);
+        let mut seen = HashSet::new();
+
+        for event in &bundle.events {
+            match event {
+                Event::AssertOwnership {
+                    owner,
+                    owned,
+                    share_pct,
+                    bitemporal,
+                    provenance,
+                    ..
+                } => {
+                    let predicate = format!("owns_{share_pct}");
+                    let id = AssertionId::deterministic(
+                        owner.entity(),
+                        &predicate,
+                        owned.entity(),
+                        bitemporal,
+                        0,
+                        &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                    );
+                    assert!(seen.insert(id), "duplicate ownership id {:?}", id.0);
+                }
+                Event::LateArrival {
+                    subject,
+                    predicate,
+                    object,
+                    bitemporal,
+                    provenance,
+                    ..
+                } if predicate.starts_with("owns_") => {
+                    let id = AssertionId::deterministic(
+                        *subject,
+                        predicate,
+                        *object,
+                        bitemporal,
+                        1,
+                        &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                    );
+                    assert!(seen.insert(id), "duplicate late ownership id {:?}", id.0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn retroactive_new_ids_are_unique() {
+        use std::collections::HashSet;
+
+        use benchmark_core::{AssertionId, Bitemporal, Event, oracle::Oracle};
+
+        let bundle = generate_fixtures(42, Scale::S);
+        let oracle = Oracle::from_events(&bundle.events);
+        let mut seen = HashSet::new();
+        for event in &bundle.events {
+            let Event::RetroactiveCorrection {
+                assertion_id,
+                new_valid_from,
+                corrected_at,
+            } = event
+            else {
+                continue;
+            };
+            let Some(old) = oracle.get_assertion(*assertion_id) else {
+                continue;
+            };
+            let new_id = AssertionId::deterministic(
+                old.subject,
+                &old.predicate,
+                old.object,
+                &Bitemporal {
+                    valid_from: *new_valid_from,
+                    valid_to: old.bitemporal.valid_to,
+                    known_from: *corrected_at,
+                    known_to: None,
+                },
+                0,
+                &format!("retro:{}@{}", assertion_id.0, corrected_at.timestamp()),
+            );
+            assert!(seen.insert(new_id), "duplicate retro id {:?}", new_id.0);
+        }
     }
 
     #[test]

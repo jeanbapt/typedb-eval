@@ -106,6 +106,30 @@ impl AssertionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Stable id shared by oracle and both backends for the same assertion content.
+    pub fn deterministic(
+        subject: EntityId,
+        predicate: &str,
+        object: EntityId,
+        bitemporal: &Bitemporal,
+        disambiguator: u32,
+        salt: &str,
+    ) -> Self {
+        let name = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            subject.0,
+            predicate,
+            object.0,
+            bitemporal.valid_from.timestamp(),
+            bitemporal.valid_to.map(|t| t.timestamp()).unwrap_or(0),
+            bitemporal.known_from.timestamp(),
+            bitemporal.known_to.map(|t| t.timestamp()).unwrap_or(0),
+            disambiguator,
+            salt,
+        );
+        Self(Uuid::new_v5(&Uuid::NAMESPACE_OID, name.as_bytes()))
+    }
 }
 
 impl Default for AssertionId {

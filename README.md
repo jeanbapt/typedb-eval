@@ -237,6 +237,45 @@ Pour Cursor, copier [`.cursor/mcp.json.example`](.cursor/mcp.json.example) vers 
 
 ---
 
+## Résultats récents (scale S, seed 42, cold)
+
+Dernière exécution après correction des bugs de correctness (assertion IDs déterministes, knowledge closure, traversée Q9, alignement oracle sur TypeDB).
+
+| Backend | Pass rate | Ingest | Churn | Avg p50 | Missed relations | False allow/block |
+|---------|-----------|--------|-------|---------|------------------|-------------------|
+| **PostgreSQL** | 94.7% | 2.3 s | 1.16 | 4.0 ms | 0 | 0 |
+| **TypeDB** | **98.3%** | 6.4 s | 1.01 | 295 ms | 2 | 0 |
+
+**Q7/Q8 (replay bitemporal / vue rétrospective)** : 100 % de pass rate sur TypeDB après alignement de la couche requête avec l'oracle (chaînages d'ownership, exposure, contradictions, compatibilité contextuelle).
+
+**Évolution de schéma (Q9)** : TypeDB conserve 100 % de rappel avec requête gelée ; PostgreSQL tombe à 28.7 % et nécessite ~20 LOC de réparation ([`results/SCHEMA_EVOLUTION.md`](results/SCHEMA_EVOLUTION.md)).
+
+Verdict actuel : **[INVESTIGATE HYBRID](results/DECISION.md)** — TypeDB gagne sur l'évolution d'ontologie ; PostgreSQL gagne largement en latence.
+
+---
+
+## Bitemporalité : ce qu'on a appris
+
+Ce benchmark **ne montre pas** que TypeDB gère mal le temps. Les échecs initiaux (~59 % pass rate TypeDB) venaient surtout de **bugs d'implémentation** dans le backend Rust/TypeQL, pas d'une limite du moteur :
+
+| Problème corrigé | Impact |
+|------------------|--------|
+| IDs d'assertion non synchronisés entre oracle et backends | Q7/Q8 ne voyaient jamais les `CloseAssertionKnowledge` / `RetroactiveCorrection` |
+| `beneficial_owners` ne suivait que les arêtes personne→société directes | Chaînes société→société→personne ignorées |
+| Filtres bitemporaux incomplets (bornes inférieures `valid_from` / `known_from`) | Assertions futures comptées comme visibles |
+| Syntaxe TypeQL pour `known-to` (`update` vs `delete`/`insert` invalides) | Ingest échouait sur knowledge closure |
+| Q6 comparait toutes les paires d'evidence sans regroupement par contexte | 28 faux échecs |
+
+**Où TypeDB reste plus faible dans *cette* évaluation** :
+
+1. **Ergonomie** — Combiner récursion (ownership), polymorphisme et filtres bitemporaux en TypeQL demande plus de glue code qu'un CTE récursif Postgres avec `tstzrange @> timestamptz`.
+2. **Pushdown** — Postgres filtre les intervalles via GiST en SQL ; notre backend TypeDB fetch souvent les relations puis filtre en Rust (`row_is_active`).
+3. **Performance** — ~73× plus lent en p50 sur scale S, en partie à cause de ce pattern fetch-and-filter.
+
+En résumé : le **modèle** TypeDB supporte la bitemporalité exigée par SGRS (Q7/Q8 passent). Le **coût** se paie en complexité de requête et en latence, pas en sémantique temporelle intrinsèquement cassée.
+
+---
+
 ## Verdict
 
 Voir [results/DECISION.md](results/DECISION.md) après exécution du benchmark. Le document couvre :

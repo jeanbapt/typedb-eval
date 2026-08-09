@@ -25,6 +25,8 @@ attribute observed-at, value datetime;
 attribute alias-text, value string;
 attribute merge-flag, value boolean;
 
+attribute assertion-id, value string;
+
 attribute trust-name, value string;
 
 entity person,
@@ -75,7 +77,8 @@ relation ownership,
     owns valid-to,
     owns known-from,
     owns known-to,
-    owns observed-at;
+    owns observed-at,
+    owns assertion-id;
 
 relation identity-link,
     relates linked-person,
@@ -109,7 +112,8 @@ relation generic-assertion,
     owns valid-to,
     owns known-from,
     owns known-to,
-    owns observed-at;
+    owns observed-at,
+    owns assertion-id;
 
 # Ontology extension: genuinely 4-ary, with a polymorphic `controller` role fillable by
 # person, company or trust.

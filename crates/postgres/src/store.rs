@@ -68,13 +68,25 @@ impl PostgresStore {
           FROM ownership_assertion
          WHERE owned_id = $1 AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
         UNION ALL
+        SELECT 'ownership' AS rel, 'owner' AS role, object_id AS other
+          FROM assertion
+         WHERE subject_id = $1 AND predicate LIKE 'owns_%'
+           AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
+        UNION ALL
+        SELECT 'ownership', 'owned', subject_id
+          FROM assertion
+         WHERE object_id = $1 AND predicate LIKE 'owns_%'
+           AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
+        UNION ALL
         SELECT 'generic-assertion', 'subject', object_id
           FROM assertion
-         WHERE subject_id = $1 AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
+         WHERE subject_id = $1 AND predicate NOT LIKE 'owns_%'
+           AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
         UNION ALL
         SELECT 'generic-assertion', 'object', subject_id
           FROM assertion
-         WHERE object_id = $1 AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
+         WHERE object_id = $1 AND predicate NOT LIKE 'owns_%'
+           AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
         UNION ALL
         SELECT 'sanction-listing', 'sanctioned-person', NULL::uuid
           FROM sanction_listing
@@ -410,12 +422,22 @@ impl PostgresStore {
                     provenance.source_authority
                 };
                 self.ensure_source(&source_id, source_authority).await?;
+                let predicate = format!("owns_{share_pct}");
+                let assertion_id = AssertionId::deterministic(
+                    owner.entity(),
+                    &predicate,
+                    owned.entity(),
+                    &bitemporal,
+                    0,
+                    &format!("{}@{}", source_id, provenance.observed_at.timestamp()),
+                );
                 sqlx::query(
                     r#"INSERT INTO ownership_assertion
-                    (owner_id, owner_kind, owned_id, share_pct, evidence, governance, context, role, jurisdiction,
+                    (id, owner_id, owner_kind, owned_id, share_pct, evidence, governance, context, role, jurisdiction,
                      source_id, source_authority, observed_at, valid_range, known_range, predicate)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::tstzrange,$14::tstzrange,$15)"#,
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::tstzrange,$15::tstzrange,$16)"#,
                 )
+                .bind(assertion_id.0)
                 .bind(owner.entity().0)
                 .bind(owner.kind_str())
                 .bind(owned.0)
@@ -430,7 +452,7 @@ impl PostgresStore {
                 .bind(provenance.observed_at)
                 .bind(&valid_range)
                 .bind(&known_range)
-                .bind(format!("owns_{share_pct}"))
+                .bind(&predicate)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
@@ -495,12 +517,21 @@ impl PostgresStore {
             } => {
                 let (valid_range, known_range) = self.apply_ablation_bitemporal(&bitemporal);
                 self.ensure_source(&provenance.source_id, provenance.source_authority).await?;
-                for ev in [supporting, refuting] {
+                for (ev, disc) in [(supporting, 0u32), (refuting, 1u32)] {
+                    let assertion_id = AssertionId::deterministic(
+                        subject,
+                        &predicate,
+                        object,
+                        &bitemporal,
+                        disc,
+                        &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                    );
                     sqlx::query(
-                        r#"INSERT INTO assertion (subject_id, predicate, object_id, evidence, context,
+                        r#"INSERT INTO assertion (id, subject_id, predicate, object_id, evidence, context,
                          source_id, source_authority, observed_at, valid_range, known_range, jurisdiction, governance)
-                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::tstzrange,$10::tstzrange,'GLOBAL','OBSERVED')"#,
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::tstzrange,$11::tstzrange,'GLOBAL','OBSERVED')"#,
                     )
+                    .bind(assertion_id.0)
                     .bind(subject.0)
                     .bind(&predicate)
                     .bind(object.0)
@@ -529,24 +560,61 @@ impl PostgresStore {
             } => {
                 let (valid_range, known_range) = self.apply_ablation_bitemporal(&bitemporal);
                 self.ensure_source(&provenance.source_id, provenance.source_authority).await?;
-                sqlx::query(
-                    r#"INSERT INTO assertion (subject_id, predicate, object_id, evidence, context,
-                     source_id, source_authority, observed_at, valid_range, known_range, jurisdiction, governance)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::tstzrange,$10::tstzrange,'GLOBAL','OBSERVED')"#,
-                )
-                .bind(subject.0)
-                .bind(&predicate)
-                .bind(object.0)
-                .bind(Self::evidence_str(evidence))
-                .bind(Self::context_str(context))
-                .bind(&provenance.source_id)
-                .bind(provenance.source_authority)
-                .bind(provenance.observed_at)
-                .bind(&valid_range)
-                .bind(&known_range)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+                let assertion_id = AssertionId::deterministic(
+                    subject,
+                    &predicate,
+                    object,
+                    &bitemporal,
+                    1,
+                    &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                );
+                if predicate.starts_with("owns_") {
+                    let share_pct: f32 = predicate
+                        .strip_prefix("owns_")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0.0);
+                    sqlx::query(
+                        r#"INSERT INTO ownership_assertion
+                        (id, owner_id, owner_kind, owned_id, share_pct, evidence, governance, context, role, jurisdiction,
+                         source_id, source_authority, observed_at, valid_range, known_range, predicate)
+                        VALUES ($1,$2,'person',$3,$4,$5,'OBSERVED',$6,'SHAREHOLDER','GLOBAL',$7,$8,$9,$10::tstzrange,$11::tstzrange,$12)"#,
+                    )
+                    .bind(assertion_id.0)
+                    .bind(subject.0)
+                    .bind(object.0)
+                    .bind(share_pct)
+                    .bind(Self::evidence_str(evidence))
+                    .bind(Self::context_str(context))
+                    .bind(&provenance.source_id)
+                    .bind(provenance.source_authority)
+                    .bind(provenance.observed_at)
+                    .bind(&valid_range)
+                    .bind(&known_range)
+                    .bind(&predicate)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+                } else {
+                    sqlx::query(
+                        r#"INSERT INTO assertion (id, subject_id, predicate, object_id, evidence, context,
+                         source_id, source_authority, observed_at, valid_range, known_range, jurisdiction, governance)
+                         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::tstzrange,$11::tstzrange,'GLOBAL','OBSERVED')"#,
+                    )
+                    .bind(assertion_id.0)
+                    .bind(subject.0)
+                    .bind(&predicate)
+                    .bind(object.0)
+                    .bind(Self::evidence_str(evidence))
+                    .bind(Self::context_str(context))
+                    .bind(&provenance.source_id)
+                    .bind(provenance.source_authority)
+                    .bind(provenance.observed_at)
+                    .bind(&valid_range)
+                    .bind(&known_range)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+                }
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
             }
@@ -567,9 +635,24 @@ impl PostgresStore {
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
             }
-            Event::RetroactiveCorrection { .. } => {
-                delta.physical_mutations = 1;
-                delta.semantic_changes = 1;
+            Event::RetroactiveCorrection {
+                assertion_id,
+                new_valid_from,
+                corrected_at,
+            } => {
+                if self
+                    .retroactive_correct_ownership(assertion_id, new_valid_from, corrected_at)
+                    .await?
+                {
+                    delta.physical_mutations = 1;
+                    delta.semantic_changes = 1;
+                } else if self
+                    .retroactive_correct_generic(assertion_id, new_valid_from, corrected_at)
+                    .await?
+                {
+                    delta.physical_mutations = 1;
+                    delta.semantic_changes = 1;
+                }
             }
             Event::CloseAssertionKnowledge {
                 assertion_id,
@@ -711,41 +794,25 @@ impl PostgresStore {
         known_at: Timestamp,
     ) -> Result<Vec<PersonId>> {
         let rows = sqlx::query(
-            r#"SELECT DISTINCT o.owner_id FROM ownership_assertion o
-               WHERE o.owned_id = $1
-                 AND o.valid_range @> $2::timestamptz
-                 AND o.known_range @> $3::timestamptz
-                 AND o.evidence != 'REFUTED'"#,
-        )
-        .bind(entity.0)
-        .bind(valid_at)
-        .bind(known_at)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
-
-        // Recursive CTE for indirect ownership
-        let indirect = sqlx::query(
             r#"
             WITH RECURSIVE ownership_chain AS (
-                SELECT o.owner_id, o.owned_id, 1 AS depth
+                SELECT o.owner_id, o.owner_kind, o.owned_id, 1 AS depth
                 FROM ownership_assertion o
                 WHERE o.owned_id = $1
                   AND o.valid_range @> $2::timestamptz
                   AND o.known_range @> $3::timestamptz
                   AND o.evidence != 'REFUTED'
-                UNION ALL
-                SELECT o.owner_id, o.owned_id, oc.depth + 1
+                UNION
+                SELECT o.owner_id, o.owner_kind, o.owned_id, oc.depth + 1
                 FROM ownership_assertion o
-                JOIN ownership_chain oc ON o.owned_id = (
-                    SELECT c.id FROM company c WHERE c.id = oc.owner_id LIMIT 1
-                )
+                INNER JOIN ownership_chain oc
+                    ON o.owned_id = oc.owner_id AND oc.owner_kind = 'company'
                 WHERE o.valid_range @> $2::timestamptz
                   AND o.known_range @> $3::timestamptz
                   AND o.evidence != 'REFUTED'
                   AND oc.depth < 10
             )
-            SELECT DISTINCT owner_id FROM ownership_chain
+            SELECT DISTINCT owner_id FROM ownership_chain WHERE owner_kind = 'person'
             "#,
         )
         .bind(entity.0)
@@ -757,7 +824,6 @@ impl PostgresStore {
 
         let mut owners: Vec<PersonId> = rows
             .iter()
-            .chain(indirect.iter())
             .filter_map(|r| r.try_get::<Uuid, _>("owner_id").ok())
             .map(PersonId)
             .collect();
@@ -858,12 +924,13 @@ impl PostgresStore {
         let indirect_rows = sqlx::query(
             r#"
             WITH RECURSIVE chain AS (
-                SELECT owner_id, owned_id, 1 AS depth FROM ownership_assertion
+                SELECT owner_id, owner_kind, owned_id, 1 AS depth FROM ownership_assertion
                 WHERE owned_id = $1 AND valid_range @> $2::timestamptz
                   AND known_range @> $3::timestamptz AND evidence != 'REFUTED'
-                UNION ALL
-                SELECT o.owner_id, o.owned_id, c.depth + 1
-                FROM ownership_assertion o JOIN chain c ON o.owned_id = c.owner_id
+                UNION
+                SELECT o.owner_id, o.owner_kind, o.owned_id, c.depth + 1
+                FROM ownership_assertion o
+                INNER JOIN chain c ON o.owned_id = c.owner_id AND c.owner_kind = 'company'
                 WHERE o.valid_range @> $2::timestamptz AND o.known_range @> $3::timestamptz
                   AND o.evidence != 'REFUTED' AND c.depth < 10
             )
@@ -1114,5 +1181,162 @@ impl PostgresStore {
         } else {
             Ok(Compatibility::Consistent)
         }
+    }
+
+    async fn retroactive_correct_ownership(
+        &self,
+        assertion_id: AssertionId,
+        new_valid_from: Timestamp,
+        corrected_at: Timestamp,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            r#"SELECT owner_id, owner_kind, owned_id, share_pct, evidence, governance, context, role,
+                      jurisdiction, source_id, source_authority, observed_at, valid_range, known_range, predicate
+               FROM ownership_assertion WHERE id = $1"#,
+        )
+        .bind(assertion_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+
+        let Some(row) = row else {
+            return Ok(false);
+        };
+
+        sqlx::query(
+            "UPDATE ownership_assertion SET known_range = tstzrange(lower(known_range), $1::timestamptz, '[)') WHERE id = $2",
+        )
+        .bind(corrected_at)
+        .bind(assertion_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+
+        let owner_id: Uuid = row.get("owner_id");
+        let owned_id: Uuid = row.get("owned_id");
+        let predicate: String = row.get("predicate");
+        let valid_upper: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT upper(valid_range) FROM ownership_assertion WHERE id = $1",
+        )
+        .bind(assertion_id.0)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+
+        let valid_to = valid_upper.filter(|t| *t > new_valid_from);
+        let new_bitemporal = Bitemporal {
+            valid_from: new_valid_from,
+            valid_to,
+            known_from: corrected_at,
+            known_to: None,
+        };
+        let new_id = AssertionId::deterministic(
+            EntityId::from_uuid(owner_id),
+            &predicate,
+            EntityId::from_uuid(owned_id),
+            &new_bitemporal,
+            0,
+            &format!("retro:{}@{}", assertion_id.0, corrected_at.timestamp()),
+        );
+        let (valid_range, known_range) = self.apply_ablation_bitemporal(&new_bitemporal);
+
+        sqlx::query(
+            r#"INSERT INTO ownership_assertion
+            (id, owner_id, owner_kind, owned_id, share_pct, evidence, governance, context, role, jurisdiction,
+             source_id, source_authority, observed_at, valid_range, known_range, predicate)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::tstzrange,$15::tstzrange,$16)"#,
+        )
+        .bind(new_id.0)
+        .bind(owner_id)
+        .bind(row.get::<String, _>("owner_kind"))
+        .bind(owned_id)
+        .bind(row.get::<f32, _>("share_pct"))
+        .bind(row.get::<String, _>("evidence"))
+        .bind(row.get::<String, _>("governance"))
+        .bind(row.get::<String, _>("context"))
+        .bind(row.get::<Option<String>, _>("role"))
+        .bind(row.get::<String, _>("jurisdiction"))
+        .bind(row.get::<String, _>("source_id"))
+        .bind(row.get::<f32, _>("source_authority"))
+        .bind(row.get::<DateTime<Utc>, _>("observed_at"))
+        .bind(&valid_range)
+        .bind(&known_range)
+        .bind(&predicate)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+        Ok(true)
+    }
+
+    async fn retroactive_correct_generic(
+        &self,
+        assertion_id: AssertionId,
+        new_valid_from: Timestamp,
+        corrected_at: Timestamp,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            r#"SELECT subject_id, predicate, object_id, evidence, context, source_id, source_authority,
+                      observed_at, valid_range, known_range, jurisdiction, governance
+               FROM assertion WHERE id = $1"#,
+        )
+        .bind(assertion_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+
+        let Some(row) = row else {
+            return Ok(false);
+        };
+
+        sqlx::query(
+            "UPDATE assertion SET known_range = tstzrange(lower(known_range), $1::timestamptz, '[)') WHERE id = $2",
+        )
+        .bind(corrected_at)
+        .bind(assertion_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+
+        let subject_id: Uuid = row.get("subject_id");
+        let object_id: Uuid = row.get("object_id");
+        let predicate: String = row.get("predicate");
+        let new_bitemporal = Bitemporal {
+            valid_from: new_valid_from,
+            valid_to: None,
+            known_from: corrected_at,
+            known_to: None,
+        };
+        let new_id = AssertionId::deterministic(
+            EntityId::from_uuid(subject_id),
+            &predicate,
+            EntityId::from_uuid(object_id),
+            &new_bitemporal,
+            0,
+            &format!("retro:{}@{}", assertion_id.0, corrected_at.timestamp()),
+        );
+        let (valid_range, known_range) = self.apply_ablation_bitemporal(&new_bitemporal);
+
+        sqlx::query(
+            r#"INSERT INTO assertion (id, subject_id, predicate, object_id, evidence, context,
+             source_id, source_authority, observed_at, valid_range, known_range, jurisdiction, governance)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::tstzrange,$11::tstzrange,$12,$13)"#,
+        )
+        .bind(new_id.0)
+        .bind(subject_id)
+        .bind(&predicate)
+        .bind(object_id)
+        .bind(row.get::<String, _>("evidence"))
+        .bind(row.get::<String, _>("context"))
+        .bind(row.get::<String, _>("source_id"))
+        .bind(row.get::<f32, _>("source_authority"))
+        .bind(row.get::<DateTime<Utc>, _>("observed_at"))
+        .bind(&valid_range)
+        .bind(&known_range)
+        .bind(row.get::<String, _>("jurisdiction"))
+        .bind(row.get::<String, _>("governance"))
+        .execute(&self.pool)
+        .await
+        .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+        Ok(true)
     }
 }

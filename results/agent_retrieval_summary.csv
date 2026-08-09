@@ -1,3 +1,0 @@
-backend,mcp_url,scale,seed,probes,schema_introspection_ms,avg_p50_us,avg_p95_us,mcp_round_trips,success_rate,errors,schema_context_tokens,nl_prompt_tokens,query_generation_tokens,tool_response_tokens,total_input_tokens,total_output_tokens,total_estimated_tokens
-postgres-mcp,http://localhost:8899,S,42,20,161,11391,16287,23,1.0000,0,296,320,1650,686,1302,1650,2952
-typedb-mcp,http://localhost:8001,S,42,20,502,216703,250367,23,1.0000,0,53,320,960,540,913,960,1873

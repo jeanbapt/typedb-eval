@@ -142,10 +142,18 @@ impl Oracle {
                 provenance,
                 bitemporal,
             } => {
+                let predicate = format!("owns_{share_pct}");
                 let assertion = Assertion {
-                    id: AssertionId::new(),
+                    id: AssertionId::deterministic(
+                        owner.entity(),
+                        &predicate,
+                        owned.entity(),
+                        &bitemporal,
+                        0,
+                        &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                    ),
                     subject: owner.entity(),
-                    predicate: format!("owns_{share_pct}"),
+                    predicate,
                     object: owned.entity(),
                     evidence,
                     governance,
@@ -213,7 +221,14 @@ impl Oracle {
                 delta.physical_mutations += 2;
                 delta.semantic_changes += 1;
                 self.assertions.push(Assertion {
-                    id: AssertionId::new(),
+                    id: AssertionId::deterministic(
+                        subject,
+                        &predicate,
+                        object,
+                        &bitemporal,
+                        0,
+                        &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                    ),
                     subject,
                     predicate: predicate.clone(),
                     object,
@@ -226,7 +241,7 @@ impl Oracle {
                     bitemporal: bitemporal.clone(),
                 });
                 self.assertions.push(Assertion {
-                    id: AssertionId::new(),
+                    id: AssertionId::deterministic(subject, &predicate, object, &bitemporal, 1, &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp())),
                     subject,
                     predicate,
                     object,
@@ -249,8 +264,24 @@ impl Oracle {
                 if let Some(idx) = self.assertions.iter().position(|a| a.id == assertion_id) {
                     let old = self.assertions[idx].clone();
                     self.assertions[idx].bitemporal.known_to = Some(corrected_at);
+                    let valid_to = old
+                        .bitemporal
+                        .valid_to
+                        .filter(|t| *t > new_valid_from);
                     self.assertions.push(Assertion {
-                        id: AssertionId::new(),
+                        id: AssertionId::deterministic(
+                            old.subject,
+                            &old.predicate,
+                            old.object,
+                            &Bitemporal {
+                                valid_from: new_valid_from,
+                                valid_to,
+                                known_from: corrected_at,
+                                known_to: None,
+                            },
+                            0,
+                            &format!("retro:{}@{}", assertion_id.0, corrected_at.timestamp()),
+                        ),
                         subject: old.subject,
                         predicate: old.predicate,
                         object: old.object,
@@ -262,7 +293,7 @@ impl Oracle {
                         provenance: old.provenance,
                         bitemporal: Bitemporal {
                             valid_from: new_valid_from,
-                            valid_to: old.bitemporal.valid_to,
+                            valid_to,
                             known_from: corrected_at,
                             known_to: None,
                         },
@@ -294,7 +325,14 @@ impl Oracle {
                 delta.physical_mutations += 1;
                 delta.semantic_changes += 1;
                 self.assertions.push(Assertion {
-                    id: AssertionId::new(),
+                    id: AssertionId::deterministic(
+                        subject,
+                        &predicate,
+                        object,
+                        &bitemporal,
+                        1,
+                        &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                    ),
                     subject,
                     predicate,
                     object,
@@ -375,6 +413,10 @@ impl Oracle {
 
     pub fn assertion_ids(&self) -> Vec<AssertionId> {
         self.assertions.iter().map(|a| a.id).collect()
+    }
+
+    pub fn get_assertion(&self, id: AssertionId) -> Option<&Assertion> {
+        self.assertions.iter().find(|a| a.id == id)
     }
 
     pub fn visible_assertions(
