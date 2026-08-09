@@ -10,8 +10,8 @@ use benchmark_core::error::Result;
 use benchmark_core::{
     AblationDimension, AssertionId, Bitemporal, Compatibility, ComplianceStore,
     Conflict, Context, Decision, EntityId, EntityState, Event, EvidenceState, Exposure,
-    GovernanceLevel, IdentityAction, NeighborEdge, Neighborhood, PersonId, Role, StateDelta,
-    Timestamp,
+    GovernanceLevel, IdentityAction, NeighborEdge, Neighborhood, PartyId, PersonId, Role,
+    StateDelta, Timestamp,
 };
 
 pub struct PostgresStore {
@@ -136,6 +136,7 @@ impl PostgresStore {
             Context::CorporateRegistry => "CORPORATE_REGISTRY",
             Context::Kyc => "KYC",
             Context::Sanctions => "SANCTIONS",
+            Context::Regulatory => "REGULATORY",
         }
     }
 
@@ -411,11 +412,12 @@ impl PostgresStore {
                 self.ensure_source(&source_id, source_authority).await?;
                 sqlx::query(
                     r#"INSERT INTO ownership_assertion
-                    (owner_id, owned_id, share_pct, evidence, governance, context, role, jurisdiction,
+                    (owner_id, owner_kind, owned_id, share_pct, evidence, governance, context, role, jurisdiction,
                      source_id, source_authority, observed_at, valid_range, known_range, predicate)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::tstzrange,$13::tstzrange,$14)"#,
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::tstzrange,$14::tstzrange,$15)"#,
                 )
-                .bind(owner.0)
+                .bind(owner.entity().0)
+                .bind(owner.kind_str())
                 .bind(owned.0)
                 .bind(share_pct)
                 .bind(Self::evidence_str(evidence))
@@ -568,6 +570,24 @@ impl PostgresStore {
             Event::RetroactiveCorrection { .. } => {
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
+            }
+            Event::CloseAssertionKnowledge {
+                assertion_id,
+                known_to,
+            } => {
+                let bound = known_to.to_rfc3339();
+                for table in ["ownership_assertion", "assertion"] {
+                    sqlx::query(&format!(
+                        "UPDATE {table} SET known_range = tstzrange(lower(known_range), $1::timestamptz, '[)') WHERE id = $2"
+                    ))
+                    .bind(known_to)
+                    .bind(assertion_id.0)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+                }
+                delta.physical_mutations += 1;
+                let _ = bound;
             }
             Event::RegisterTrust {
                 id,

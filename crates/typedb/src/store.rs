@@ -113,6 +113,21 @@ impl TypeDbStore {
             benchmark_core::Context::CorporateRegistry => "CORPORATE_REGISTRY",
             benchmark_core::Context::Kyc => "KYC",
             benchmark_core::Context::Sanctions => "SANCTIONS",
+            benchmark_core::Context::Regulatory => "REGULATORY",
+        }
+    }
+
+    fn party_match(owner: benchmark_core::PartyId) -> String {
+        match owner {
+            benchmark_core::PartyId::Person(p) => {
+                format!(r#"$owner isa person, has entity-id "{}";"#, p.0)
+            }
+            benchmark_core::PartyId::Company(c) => {
+                format!(r#"$owner isa company, has entity-id "{}";"#, c.0)
+            }
+            benchmark_core::PartyId::Trust(t) => {
+                format!(r#"$owner isa trust, has entity-id "{}";"#, t.0)
+            }
         }
     }
 
@@ -314,7 +329,7 @@ impl TypeDbStore {
                     .unwrap_or_default();
                 let q = format!(
                     r#"match
-                        $owner isa person, has entity-id "{owner_id}";
+                        {owner_match}
                         $owned isa company, has entity-id "{owned_id}";
                     insert
                         (owner: $owner, owned: $owned) isa ownership,
@@ -329,7 +344,7 @@ impl TypeDbStore {
                         has valid-from {valid_from}{valid_to},
                         has known-from {known_from}{known_to},
                         has observed-at {observed};"#,
-                    owner_id = owner.0,
+                    owner_match = Self::party_match(owner),
                     owned_id = owned.0,
                     share_pct = share_pct,
                     evidence = Self::evidence_str(evidence),
@@ -532,7 +547,7 @@ impl TypeDbStore {
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
             }
-            Event::RetroactiveCorrection { .. } => {
+            Event::RetroactiveCorrection { .. } | Event::CloseAssertionKnowledge { .. } => {
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
             }

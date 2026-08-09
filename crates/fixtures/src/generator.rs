@@ -4,10 +4,9 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
 use benchmark_core::{
-    oracle::Oracle, Bitemporal, Context, Event, FixtureBundle, GovernanceLevel, OntologyGeneration,
-    PersonId, Provenance, Role, Scale, TrustId,
+    oracle::Oracle, Bitemporal, CompanyId, Context, Event, EvidenceState, FixtureBundle,
+    GovernanceLevel, OntologyGeneration, PartyId, PersonId, Provenance, Role, Scale, TrustId,
 };
-use benchmark_core::{CompanyId, EvidenceState};
 
 const JURISDICTIONS: &[&str] = &["US", "UK", "EU", "SG"];
 const SOURCES: &[&str] = &["registrar", "kyc_vendor", "sanctions_db", "news_feed", "manual_review"];
@@ -21,6 +20,36 @@ const LAST_NAMES: &[&str] = &[
 ];
 const COMPANY_PREFIXES: &[&str] = &["Acme", "Global", "Pacific", "Atlantic", "Northern", "Southern"];
 const COMPANY_SUFFIXES: &[&str] = &["Ltd", "Limited", "LLC", "Inc", "Corp", "GmbH"];
+
+struct ScaleParams {
+    num_persons: usize,
+    num_companies: usize,
+    num_ownerships: usize,
+    chain_targets: usize,
+}
+
+fn scale_params(scale: Scale) -> ScaleParams {
+    match scale {
+        Scale::S => ScaleParams {
+            num_persons: 100,
+            num_companies: 40,
+            num_ownerships: 250,
+            chain_targets: 12,
+        },
+        Scale::M => ScaleParams {
+            num_persons: 300,
+            num_companies: 120,
+            num_ownerships: 800,
+            chain_targets: 30,
+        },
+        Scale::L => ScaleParams {
+            num_persons: 500,
+            num_companies: 200,
+            num_ownerships: 1000,
+            chain_targets: 30,
+        },
+    }
+}
 
 pub fn generate_fixtures(seed: u64, scale: Scale) -> FixtureBundle {
     generate_fixtures_with(seed, scale, OntologyGeneration::Base)
@@ -36,12 +65,9 @@ pub fn generate_fixtures_with(
     scale: Scale,
     generation: OntologyGeneration,
 ) -> FixtureBundle {
+    let params = scale_params(scale);
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let base_time = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
-
-    let num_companies = 200;
-    let num_persons = 500;
-    let num_ownerships = 1000;
 
     let mut events: Vec<Event> = Vec::new();
     let mut persons: Vec<PersonId> = Vec::new();
@@ -49,15 +75,16 @@ pub fn generate_fixtures_with(
 
     // Compliance rules (~20)
     for i in 0..20 {
-        events.push(Event::ComplianceRule {
+        let event = Event::ComplianceRule {
             rule_id: format!("rule_{i:02}"),
             description: format!("Beneficial ownership threshold rule {i}"),
             threshold_pct: 20.0 + (i as f32),
-        });
+        };
+        events.push(event);
     }
 
     // Register persons
-    for i in 0..num_persons {
+    for i in 0..params.num_persons {
         let first = FIRST_NAMES[i % FIRST_NAMES.len()];
         let last = LAST_NAMES[(i * 7 + 3) % LAST_NAMES.len()];
         let name = format!("{first} {last}");
@@ -70,30 +97,32 @@ pub fn generate_fixtures_with(
             1 => Context::Kyc,
             _ => Context::Sanctions,
         };
-        events.push(Event::RegisterPerson {
+        let event = Event::RegisterPerson {
             id,
             name: name.clone(),
             canonical_name: canonical.clone(),
             jurisdiction: jurisdiction.to_string(),
             context,
             at: base_time + Duration::days(i as i64),
-        });
+        };
+        events.push(event);
 
-        // Homonym / alias patterns
-        if i % 17 == 0 && i + 1 < num_persons {
+        // Homonym / alias patterns — Q4 probe pairs registered on final oracle below.
+        if i % 17 == 0 && i + 1 < params.num_persons {
             let alias_name = if first == "John" {
                 "Jonathan".to_string() + " " + last
             } else {
                 format!("{first} {last} Jr")
             };
-            events.push(Event::IdentityAlias {
+            let alias_event = Event::IdentityAlias {
                 person_a: id,
                 alias: alias_name,
                 canonical: canonical.clone(),
                 merge: i % 34 == 0,
                 context: Context::Kyc,
                 at: base_time + Duration::days(i as i64 + 1),
-            });
+            };
+            events.push(alias_event);
         }
 
         // Paraphrase already canonicalized (semantic churn test)
@@ -110,104 +139,74 @@ pub fn generate_fixtures_with(
     }
 
     // Register companies
-    for i in 0..num_companies {
+    for i in 0..params.num_companies {
         let prefix = COMPANY_PREFIXES[i % COMPANY_PREFIXES.len()];
         let suffix = COMPANY_SUFFIXES[(i * 3) % COMPANY_SUFFIXES.len()];
         let name = format!("{prefix} {suffix}");
         let id = CompanyId::from_uuid(uuid_from_seed(seed, i as u64, 2));
         companies.push(id);
-        events.push(Event::RegisterCompany {
+        let event = Event::RegisterCompany {
             id,
             name,
             jurisdiction: JURISDICTIONS[i % JURISDICTIONS.len()].to_string(),
             at: base_time + Duration::days(i as i64),
-        });
+        };
+        events.push(event);
     }
 
-    // Ownership relations
-    for i in 0..num_ownerships {
-        let owner = persons[i % persons.len()];
-        let owned = companies[i % companies.len()];
-        let share_pct = 10.0 + (i % 90) as f32;
-        let source = SOURCES[i % SOURCES.len()];
-        let valid_from = base_time + Duration::days((i % 300) as i64);
-        let known_from = valid_from + Duration::days(rng.gen_range(0..30));
+    // Guaranteed company-to-company ownership chains (depth 2–4) for first N targets.
+    events.extend(emit_company_chains(
+        seed,
+        base_time,
+        &params,
+        &persons,
+        &companies,
+    ));
 
-        events.push(Event::AssertOwnership {
+    // Ownership relations (~70% person→company, remainder company→company / mixed).
+    let mut ownership_records: Vec<OwnershipRecord> = Vec::new();
+    for i in 0..params.num_ownerships {
+        let owned = companies[i % companies.len()];
+        let owner = if i % 10 < 7 {
+            PartyId::Person(persons[i % persons.len()])
+        } else {
+            PartyId::Company(companies[(i * 3 + 1) % companies.len()])
+        };
+        let share_pct = 10.0 + (i % 90) as f32;
+        let event = build_ownership_event(
+            i,
             owner,
             owned,
             share_pct,
-            evidence: if i % 50 == 0 {
-                EvidenceState::Refuted
-            } else {
-                EvidenceState::Supported
-            },
-            governance: match i % 4 {
-                0 => GovernanceLevel::Observed,
-                1 => GovernanceLevel::Corroborated,
-                2 => GovernanceLevel::Reviewed,
-                _ => GovernanceLevel::Final,
-            },
-            context: match i % 3 {
-                0 => Context::CorporateRegistry,
-                1 => Context::Kyc,
-                _ => Context::Sanctions,
-            },
-            role: match i % 4 {
-                0 => Role::BeneficialOwner,
-                1 => Role::Director,
-                2 => Role::Shareholder,
-                _ => Role::Controller,
-            },
-            jurisdiction: JURISDICTIONS[i % JURISDICTIONS.len()].to_string(),
-            provenance: Provenance {
-                source_id: source.to_string(),
-                source_authority: 0.5 + (i % 50) as f32 / 100.0,
-                observed_at: known_from,
-            },
-            bitemporal: Bitemporal {
-                valid_from,
-                valid_to: if i % 100 == 0 {
-                    Some(valid_from + Duration::days(60))
-                } else {
-                    None
-                },
-                known_from,
-                known_to: None,
-            },
+            base_time,
+            &mut rng,
+            i % 5 == 0,
+        );
+        events.push(event.clone());
+        ownership_records.push(OwnershipRecord {
+            event,
+            share_pct,
         });
 
         // Modified ownership
         if i % 75 == 0 {
-            events.push(Event::AssertOwnership {
-                owner: persons[(i + 1) % persons.len()],
+            events.push(build_ownership_event(
+                i + 10_000,
+                PartyId::Person(persons[(i + 1) % persons.len()]),
                 owned,
-                share_pct: share_pct + 5.0,
-                evidence: EvidenceState::Supported,
-                governance: GovernanceLevel::Final,
-                context: Context::CorporateRegistry,
-                role: Role::BeneficialOwner,
-                jurisdiction: JURISDICTIONS[i % JURISDICTIONS.len()].to_string(),
-                provenance: Provenance {
-                    source_id: "registrar".into(),
-                    source_authority: 0.95,
-                    observed_at: known_from + Duration::days(90),
-                },
-                bitemporal: Bitemporal {
-                    valid_from: valid_from + Duration::days(90),
-                    valid_to: None,
-                    known_from: known_from + Duration::days(90),
-                    known_to: None,
-                },
-            });
+                share_pct + 5.0,
+                base_time,
+                &mut rng,
+                false,
+            ));
         }
     }
 
     // Sanctions listings
-    for i in (0..num_persons).step_by(25) {
+    for i in (0..params.num_persons).step_by(25) {
         let person = persons[i];
         let listed_at = base_time + Duration::days(100 + i as i64);
-        events.push(Event::SanctionListing {
+        let listing = Event::SanctionListing {
             person,
             list_name: "OFAC_SDN".into(),
             listed: true,
@@ -216,13 +215,17 @@ pub fn generate_fixtures_with(
                 valid_from: listed_at,
                 valid_to: None,
                 known_from: listed_at,
-                known_to: None,
+                known_to: if i % 5 == 0 {
+                    Some(listed_at + Duration::days(120))
+                } else {
+                    None
+                },
             },
-        });
-        // Delisting for some
+        };
+        events.push(listing);
         if i % 50 == 0 {
             let delisted_at = listed_at + Duration::days(180);
-            events.push(Event::SanctionListing {
+            let delisting = Event::SanctionListing {
                 person,
                 list_name: "OFAC_SDN".into(),
                 listed: false,
@@ -233,18 +236,28 @@ pub fn generate_fixtures_with(
                     known_from: delisted_at,
                     known_to: None,
                 },
-            });
+            };
+            events.push(delisting);
         }
     }
 
-    // Contradictory sources
-    for i in (0..num_ownerships).step_by(40) {
-        let owner = persons[i % persons.len()];
-        let owned = companies[i % companies.len()];
+    // Contradictory sources — same predicate as ownership (`owns_{pct}`).
+    for i in (0..params.num_ownerships).step_by(40) {
+        let record = &ownership_records[i];
+        let Event::AssertOwnership {
+            owner,
+            owned,
+            share_pct,
+            ..
+        } = &record.event
+        else {
+            continue;
+        };
+        let share = *share_pct;
         let at = base_time + Duration::days(200 + i as i64);
-        events.push(Event::ContradictorySource {
+        let contradiction = Event::ContradictorySource {
             subject: owner.entity(),
-            predicate: "owns".into(),
+            predicate: owns_predicate(share),
             object: owned.entity(),
             supporting: EvidenceState::Supported,
             refuting: EvidenceState::Refuted,
@@ -260,28 +273,19 @@ pub fn generate_fixtures_with(
                 known_from: at,
                 known_to: None,
             },
-        });
+        };
+        events.push(contradiction);
     }
 
-    // Retroactive corrections
-    for i in (0..50).step_by(5) {
-        if i < events.len() {
-            events.push(Event::RetroactiveCorrection {
-                assertion_id: benchmark_core::AssertionId::new(),
-                new_valid_from: base_time + Duration::days(10),
-                corrected_at: base_time + Duration::days(400 + i as i64),
-            });
-        }
-    }
-
-    // Late arrivals
-    for i in (0..num_persons).step_by(30) {
+    // Late arrivals with future known_from (valid in the past).
+    for i in (0..params.num_persons).step_by(30) {
         let person = persons[i];
         let company = companies[i % companies.len()];
+        let share_pct = 15.0 + (i % 50) as f32;
         let late_at = base_time + Duration::days(500 + i as i64);
-        events.push(Event::LateArrival {
+        let late = Event::LateArrival {
             subject: person.entity(),
-            predicate: "owns".into(),
+            predicate: owns_predicate(share_pct),
             object: company.entity(),
             evidence: EvidenceState::Supported,
             context: Context::CorporateRegistry,
@@ -296,10 +300,11 @@ pub fn generate_fixtures_with(
                 known_from: late_at,
                 known_to: None,
             },
-        });
+        };
+        events.push(late);
     }
 
-    // Expand to target scale by replaying with variations
+    // Expand to target scale by replaying with variations (closure events reserved later).
     let target = scale.event_count();
     let mut expansion_idx = 0u64;
     while events.len() < target {
@@ -307,14 +312,14 @@ pub fn generate_fixtures_with(
         if let Some(cloned) = clone_event_with_variation(&events[idx], &mut rng, base_time) {
             events.push(cloned);
         } else if !persons.is_empty() && !companies.is_empty() {
-            // Synthetic padding events for scale M/L
             let owner = persons[expansion_idx as usize % persons.len()];
             let owned = companies[expansion_idx as usize % companies.len()];
+            let share_pct = 20.0 + (expansion_idx % 60) as f32;
             let day_offset = 600 + (expansion_idx % 500) as i64;
             let at = base_time + Duration::days(day_offset);
-            events.push(Event::LateArrival {
+            let late = Event::LateArrival {
                 subject: owner.entity(),
-                predicate: "owns".into(),
+                predicate: owns_predicate(share_pct),
                 object: owned.entity(),
                 evidence: EvidenceState::Supported,
                 context: Context::Kyc,
@@ -329,15 +334,15 @@ pub fn generate_fixtures_with(
                     known_from: at,
                     known_to: None,
                 },
-            });
+            };
+            events.push(late);
             expansion_idx += 1;
         } else {
             break;
         }
     }
-    events.truncate(target);
 
-    // Shuffle only non-registration events to preserve FK order during ingest
+    // Shuffle only non-registration events to preserve FK order during ingest.
     let mut structural: Vec<Event> = Vec::new();
     let mut data_events: Vec<Event> = Vec::new();
     for event in events {
@@ -349,15 +354,43 @@ pub fn generate_fixtures_with(
         }
     }
     data_events.shuffle(&mut rng);
-    events = structural;
-    events.extend(data_events);
+
+    // Reserve space for knowledge-closure events that reference real assertion IDs.
+    let structural_len = structural.len();
+    let mut lo = 0usize;
+    let mut hi = data_events.len();
+    let mut best_data = 0usize;
+    let mut best_closure = Vec::new();
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let mut trial = structural.clone();
+        trial.extend(data_events.iter().take(mid).cloned());
+        let closure = emit_knowledge_closure_events(base_time, &Oracle::from_events(&trial));
+        if structural_len + mid + closure.len() <= target {
+            best_data = mid;
+            best_closure = closure;
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+
+    let mut events = structural;
+    events.extend(data_events.into_iter().take(best_data));
+    events.extend(best_closure);
 
     if generation.is_extended() {
         events.extend(extension_events(seed, base_time, &persons, &companies));
     }
 
-    // Build oracle and probes
-    let oracle = Oracle::from_events(&events);
+    let mut oracle = Oracle::from_events(&events);
+    for i in (0..params.num_persons).step_by(17) {
+        if i + 1 < persons.len() {
+            oracle.register_identity_probe_pair(persons[i], persons[i + 1]);
+        }
+    }
     let probe_count = 50.min(companies.len());
     let probes = oracle.generate_probes(probe_count);
     let expected = oracle.compute_expected(&probes).expect("oracle compute");
@@ -370,6 +403,205 @@ pub fn generate_fixtures_with(
         probes,
         expected,
     }
+}
+
+struct OwnershipRecord {
+    event: Event,
+    share_pct: f32,
+}
+
+fn owns_predicate(share_pct: f32) -> String {
+    format!("owns_{share_pct}")
+}
+
+fn build_ownership_event(
+    i: usize,
+    owner: PartyId,
+    owned: CompanyId,
+    share_pct: f32,
+    base_time: chrono::DateTime<Utc>,
+    rng: &mut ChaCha8Rng,
+    close_known: bool,
+) -> Event {
+    let source = SOURCES[i % SOURCES.len()];
+    let valid_from = base_time + Duration::days((i % 300) as i64);
+    let known_from = valid_from + Duration::days(rng.gen_range(0..30));
+    let known_to = if close_known {
+        Some(known_from + Duration::days(60 + (i % 90) as i64))
+    } else {
+        None
+    };
+
+    Event::AssertOwnership {
+        owner,
+        owned,
+        share_pct,
+        evidence: if i % 50 == 0 {
+            EvidenceState::Refuted
+        } else {
+            EvidenceState::Supported
+        },
+        governance: match i % 4 {
+            0 => GovernanceLevel::Observed,
+            1 => GovernanceLevel::Corroborated,
+            2 => GovernanceLevel::Reviewed,
+            _ => GovernanceLevel::Final,
+        },
+        context: match i % 3 {
+            0 => Context::CorporateRegistry,
+            1 => Context::Kyc,
+            _ => Context::Sanctions,
+        },
+        role: match i % 4 {
+            0 => Role::BeneficialOwner,
+            1 => Role::Director,
+            2 => Role::Shareholder,
+            _ => Role::Controller,
+        },
+        jurisdiction: JURISDICTIONS[i % JURISDICTIONS.len()].to_string(),
+        provenance: Provenance {
+            source_id: source.to_string(),
+            source_authority: 0.5 + (i % 50) as f32 / 100.0,
+            observed_at: known_from,
+        },
+        bitemporal: Bitemporal {
+            valid_from,
+            valid_to: if i % 100 == 0 {
+                Some(valid_from + Duration::days(60))
+            } else {
+                None
+            },
+            known_from,
+            known_to,
+        },
+    }
+}
+
+fn emit_company_chains(
+    seed: u64,
+    base_time: chrono::DateTime<Utc>,
+    params: &ScaleParams,
+    persons: &[PersonId],
+    companies: &[CompanyId],
+) -> Vec<Event> {
+    if companies.len() < 4 || persons.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    let chain_targets = params.chain_targets.min(companies.len());
+
+    for target_idx in 0..chain_targets {
+        let depth = 2 + (target_idx % 3);
+        let target = companies[target_idx];
+        let mut chain: Vec<CompanyId> = Vec::with_capacity(depth);
+        for hop in 0..depth {
+            let owner_idx = (target_idx + hop + 1) % companies.len();
+            if companies[owner_idx] != target {
+                chain.push(companies[owner_idx]);
+            }
+        }
+        if chain.is_empty() {
+            chain.push(companies[(target_idx + 1) % companies.len()]);
+        }
+
+        let mut current = target;
+        for (hop, owner_co) in chain.iter().enumerate().take(depth - 1) {
+            let share_pct = 40.0 + (target_idx + hop) as f32;
+            let valid_from = base_time + Duration::days(20 + target_idx as i64 + hop as i64);
+            let known_from = valid_from + Duration::days(1);
+            let event = Event::AssertOwnership {
+                owner: PartyId::Company(*owner_co),
+                owned: current,
+                share_pct,
+                evidence: EvidenceState::Supported,
+                governance: GovernanceLevel::Reviewed,
+                context: Context::CorporateRegistry,
+                role: Role::Controller,
+                jurisdiction: JURISDICTIONS[target_idx % JURISDICTIONS.len()].into(),
+                provenance: Provenance {
+                    source_id: "registrar".into(),
+                    source_authority: 0.9,
+                    observed_at: known_from,
+                },
+                bitemporal: Bitemporal {
+                    valid_from,
+                    valid_to: None,
+                    known_from,
+                    known_to: if target_idx % 5 == 0 {
+                        Some(known_from + Duration::days(90))
+                    } else {
+                        None
+                    },
+                },
+            };
+            out.push(event);
+            current = *owner_co;
+        }
+
+        // Terminal beneficial owner (person) at top of chain.
+        let person = persons[(target_idx * 5) % persons.len()];
+        let share_pct = 55.0 + (target_idx % 20) as f32;
+        let valid_from = base_time + Duration::days(15 + target_idx as i64);
+        let known_from = valid_from + Duration::days(2);
+        let top = Event::AssertOwnership {
+            owner: PartyId::Person(person),
+            owned: current,
+            share_pct,
+            evidence: EvidenceState::Supported,
+            governance: GovernanceLevel::Final,
+            context: Context::Kyc,
+            role: Role::BeneficialOwner,
+            jurisdiction: JURISDICTIONS[target_idx % JURISDICTIONS.len()].into(),
+            provenance: Provenance {
+                source_id: "kyc_vendor".into(),
+                source_authority: 0.88,
+                observed_at: known_from,
+            },
+            bitemporal: Bitemporal {
+                valid_from,
+                valid_to: None,
+                known_from,
+                known_to: None,
+            },
+        };
+        out.push(top);
+
+        let _ = seed;
+    }
+
+    out
+}
+
+fn emit_knowledge_closure_events(
+    base_time: chrono::DateTime<Utc>,
+    oracle: &Oracle,
+) -> Vec<Event> {
+    let assertion_ids = oracle.assertion_ids();
+    if assertion_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+
+    // CloseAssertionKnowledge on ~20% of ingested assertions.
+    for (step, assertion_id) in assertion_ids.iter().enumerate().step_by(5) {
+        out.push(Event::CloseAssertionKnowledge {
+            assertion_id: *assertion_id,
+            known_to: base_time + Duration::days(280 + step as i64),
+        });
+    }
+
+    // RetroactiveCorrection referencing real assertion IDs.
+    for (step, assertion_id) in assertion_ids.iter().enumerate().step_by(7) {
+        out.push(Event::RetroactiveCorrection {
+            assertion_id: *assertion_id,
+            new_valid_from: base_time + Duration::days(10),
+            corrected_at: base_time + Duration::days(400 + step as i64),
+        });
+    }
+
+    out
 }
 
 /// Events introduced by the ontology extension: a new party kind (`trust`) and a 4-ary
@@ -390,31 +622,30 @@ fn extension_events(
 
     let mut rng = ChaCha8Rng::seed_from_u64(seed ^ 0x5EED_1CE5_u64);
     let num_trusts = 50usize;
-    let mut events = Vec::with_capacity(num_trusts + companies.len());
+    let mut events = Vec::new();
 
     let trusts: Vec<TrustId> = (0..num_trusts)
         .map(|i| TrustId::from_uuid(uuid_from_seed(seed, i as u64, 4)))
         .collect();
 
     for (i, trust) in trusts.iter().enumerate() {
-        events.push(Event::RegisterTrust {
+        let event = Event::RegisterTrust {
             id: *trust,
             name: format!("Trust {i:03}"),
             jurisdiction: JURISDICTIONS[i % JURISDICTIONS.len()].into(),
             at: base_time + Duration::days(5),
-        });
+        };
+        events.push(event);
     }
 
     for (i, company) in companies.iter().enumerate() {
-        // Rotate the controller across all three party kinds so the polymorphic role is
-        // genuinely exercised rather than being a person-only role in disguise.
         let controller = match i % 3 {
             0 => persons[i % persons.len()].entity(),
             1 => companies[(i + 1) % companies.len()].entity(),
             _ => trusts[i % trusts.len()].entity(),
         };
         let at = base_time + Duration::days(120 + (i % 300) as i64);
-        events.push(Event::ControlViaNominee {
+        let event = Event::ControlViaNominee {
             controller,
             controlled: *company,
             nominee: persons[(i * 7) % persons.len()],
@@ -432,7 +663,8 @@ fn extension_events(
                 known_from: at,
                 known_to: None,
             },
-        });
+        };
+        events.push(event);
     }
 
     events
@@ -463,14 +695,12 @@ fn uuid_from_seed(seed: u64, index: u64, namespace: u64) -> uuid::Uuid {
 fn clone_event_with_variation(
     event: &Event,
     rng: &mut ChaCha8Rng,
-    base_time: chrono::DateTime<Utc>,
+    _base_time: chrono::DateTime<Utc>,
 ) -> Option<Event> {
     match event {
         Event::RegisterPerson { .. } => None,
         Event::RegisterCompany { .. } => None,
         Event::ComplianceRule { .. } => None,
-        // Extension events are appended verbatim after padding, never cloned, so that the
-        // base event stream stays identical across ontology generations.
         Event::RegisterTrust { .. } => None,
         Event::ControlViaNominee { .. } => None,
         Event::AssertOwnership {
@@ -538,7 +768,61 @@ fn clone_event_with_variation(
                 known_to: bitemporal.known_to,
             },
         }),
-        _ => None,
+        Event::ContradictorySource {
+            subject,
+            predicate,
+            object,
+            supporting,
+            refuting,
+            context,
+            provenance,
+            bitemporal,
+        } => Some(Event::ContradictorySource {
+            subject: *subject,
+            predicate: predicate.clone(),
+            object: *object,
+            supporting: *supporting,
+            refuting: *refuting,
+            context: *context,
+            provenance: Provenance {
+                source_id: provenance.source_id.clone(),
+                source_authority: provenance.source_authority,
+                observed_at: provenance.observed_at + Duration::hours(rng.gen_range(1..24)),
+            },
+            bitemporal: Bitemporal {
+                valid_from: bitemporal.valid_from + Duration::hours(rng.gen_range(1..12)),
+                valid_to: bitemporal.valid_to,
+                known_from: bitemporal.known_from + Duration::hours(rng.gen_range(1..12)),
+                known_to: bitemporal.known_to,
+            },
+        }),
+        Event::LateArrival {
+            subject,
+            predicate,
+            object,
+            evidence,
+            context,
+            provenance,
+            bitemporal,
+        } => Some(Event::LateArrival {
+            subject: *subject,
+            predicate: predicate.clone(),
+            object: *object,
+            evidence: *evidence,
+            context: *context,
+            provenance: Provenance {
+                source_id: provenance.source_id.clone(),
+                source_authority: provenance.source_authority,
+                observed_at: provenance.observed_at + Duration::days(rng.gen_range(1..5)),
+            },
+            bitemporal: Bitemporal {
+                valid_from: bitemporal.valid_from + Duration::days(rng.gen_range(1..5)),
+                valid_to: bitemporal.valid_to,
+                known_from: bitemporal.known_from + Duration::days(rng.gen_range(1..5)),
+                known_to: bitemporal.known_to,
+            },
+        }),
+        Event::RetroactiveCorrection { .. } | Event::CloseAssertionKnowledge { .. } => None,
     }
 }
 
@@ -560,5 +844,22 @@ mod tests {
         assert_eq!(s.events.len(), 1000);
         let m = generate_fixtures(1, Scale::M);
         assert_eq!(m.events.len(), 20000);
+    }
+
+    #[test]
+    fn ownership_uses_party_id_and_chains() {
+        let bundle = generate_fixtures(7, Scale::S);
+        let company_owners = bundle
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::AssertOwnership {
+                    owner: PartyId::Company(_),
+                    ..
+                } => Some(()),
+                _ => None,
+            })
+            .count();
+        assert!(company_owners >= 10, "expected company-to-company ownership");
     }
 }

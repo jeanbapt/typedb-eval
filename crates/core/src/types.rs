@@ -116,12 +116,59 @@ impl Default for AssertionId {
 
 pub type Timestamp = DateTime<Utc>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, PartialOrd, Ord)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Context {
     CorporateRegistry,
     Kyc,
     Sanctions,
+    /// Fourth context introduced by the schema-evolution experiment.
+    Regulatory,
+}
+
+impl Context {
+    pub fn base_contexts() -> &'static [Context] {
+        &[
+            Context::CorporateRegistry,
+            Context::Kyc,
+            Context::Sanctions,
+        ]
+    }
+
+    pub fn all_contexts(extended: bool) -> Vec<Context> {
+        let mut v = Self::base_contexts().to_vec();
+        if extended {
+            v.push(Context::Regulatory);
+        }
+        v
+    }
+}
+
+/// Polymorphic party identifier for ownership and control relations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PartyId {
+    Person(PersonId),
+    Company(CompanyId),
+    Trust(TrustId),
+}
+
+impl PartyId {
+    pub fn entity(self) -> EntityId {
+        match self {
+            PartyId::Person(p) => p.entity(),
+            PartyId::Company(c) => c.entity(),
+            PartyId::Trust(t) => t.entity(),
+        }
+    }
+
+    pub fn kind_str(self) -> &'static str {
+        match self {
+            PartyId::Person(_) => "person",
+            PartyId::Company(_) => "company",
+            PartyId::Trust(_) => "trust",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -382,7 +429,7 @@ pub enum Event {
         at: Timestamp,
     },
     AssertOwnership {
-        owner: PersonId,
+        owner: PartyId,
         owned: CompanyId,
         share_pct: f32,
         evidence: crate::EvidenceState,
@@ -422,6 +469,11 @@ pub enum Event {
         assertion_id: AssertionId,
         new_valid_from: Timestamp,
         corrected_at: Timestamp,
+    },
+    /// Close the knowledge window on a previously ingested assertion.
+    CloseAssertionKnowledge {
+        assertion_id: AssertionId,
+        known_to: Timestamp,
     },
     LateArrival {
         subject: EntityId,

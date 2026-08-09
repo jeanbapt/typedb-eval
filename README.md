@@ -63,7 +63,9 @@ Un prototype minimal, volontairement resserré :
 
 **Domaine métier du benchmark** : scénario simplifié KYB / sanctions / beneficial ownership. Ce n'est pas une implémentation réglementaire — c'est un générateur de problèmes structurels représentatifs (ownership indirect, identité incertaine, sources contradictoires, corrections rétroactives, etc.).
 
-**Hors scope** : UI, API publique, GraphQL, LLM, embeddings, framework sheaf générique, moteur réglementaire.
+**Hors scope** : UI, API publique, GraphQL, LLM, embeddings, diffusion sheaf / Laplacian / H⁰ (reste dans `sgrs-core`), moteur réglementaire.
+
+**Étude future** : persistance et requêtage de stalks et restriction maps en base (Q10–Q12) — évaluer si TypeDB apporte un avantage structurel sur un Postgres fort pour représenter l'état cross-context avant d'investir dans une deuxième couche de stockage.
 
 ---
 

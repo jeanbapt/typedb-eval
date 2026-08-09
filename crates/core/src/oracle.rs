@@ -17,16 +17,15 @@ pub struct Oracle {
     sanction_listings: Vec<SanctionRecord>,
     controls: Vec<ControlRecord>,
     rules: Vec<ComplianceRuleRecord>,
+    /// Pairs selected for Q4 probes (alias graph).
+    identity_probe_pairs: Vec<(PersonId, PersonId)>,
     total_churn: StateDelta,
 }
 
 #[derive(Debug, Clone)]
 struct TrustRecord {
-    #[allow(dead_code)]
     id: TrustId,
-    #[allow(dead_code)]
     name: String,
-    #[allow(dead_code)]
     jurisdiction: String,
 }
 
@@ -95,39 +94,41 @@ impl Oracle {
                 jurisdiction,
                 ..
             } => {
-                if self.persons.contains_key(&id) {
-                    delta.physical_mutations += 1;
-                } else {
-                    delta.physical_mutations += 1;
+                delta.physical_mutations += 1;
+                if self
+                    .persons
+                    .insert(
+                        id,
+                        PersonRecord {
+                            id,
+                            name,
+                            canonical_name,
+                            jurisdiction,
+                        },
+                    )
+                    .is_none()
+                {
                     delta.semantic_changes += 1;
                 }
-                self.persons.insert(
-                    id,
-                    PersonRecord {
-                        id,
-                        name,
-                        canonical_name,
-                        jurisdiction,
-                    },
-                );
             }
             Event::RegisterCompany {
                 id, name, jurisdiction, ..
             } => {
-                if self.companies.contains_key(&id) {
-                    delta.physical_mutations += 1;
-                } else {
-                    delta.physical_mutations += 1;
+                delta.physical_mutations += 1;
+                if self
+                    .companies
+                    .insert(
+                        id,
+                        CompanyRecord {
+                            id,
+                            name,
+                            jurisdiction,
+                        },
+                    )
+                    .is_none()
+                {
                     delta.semantic_changes += 1;
                 }
-                self.companies.insert(
-                    id,
-                    CompanyRecord {
-                        id,
-                        name,
-                        jurisdiction,
-                    },
-                );
             }
             Event::AssertOwnership {
                 owner,
@@ -245,13 +246,40 @@ impl Oracle {
             } => {
                 delta.physical_mutations += 1;
                 delta.semantic_changes += 1;
+                if let Some(idx) = self.assertions.iter().position(|a| a.id == assertion_id) {
+                    let old = self.assertions[idx].clone();
+                    self.assertions[idx].bitemporal.known_to = Some(corrected_at);
+                    self.assertions.push(Assertion {
+                        id: AssertionId::new(),
+                        subject: old.subject,
+                        predicate: old.predicate,
+                        object: old.object,
+                        evidence: old.evidence,
+                        governance: old.governance,
+                        context: old.context,
+                        role: old.role,
+                        jurisdiction: old.jurisdiction,
+                        provenance: old.provenance,
+                        bitemporal: Bitemporal {
+                            valid_from: new_valid_from,
+                            valid_to: old.bitemporal.valid_to,
+                            known_from: corrected_at,
+                            known_to: None,
+                        },
+                    });
+                }
+            }
+            Event::CloseAssertionKnowledge {
+                assertion_id,
+                known_to,
+            } => {
+                delta.physical_mutations += 1;
                 if let Some(a) = self
                     .assertions
                     .iter_mut()
                     .find(|a| a.id == assertion_id)
                 {
-                    a.bitemporal.valid_from = new_valid_from;
-                    a.bitemporal.known_from = corrected_at;
+                    a.bitemporal.known_to = Some(known_to);
                 }
             }
             Event::LateArrival {
@@ -298,7 +326,11 @@ impl Oracle {
                 ..
             } => {
                 delta.physical_mutations += 1;
-                if self.trusts.insert(id, TrustRecord { id, name, jurisdiction }).is_none() {
+                if self
+                    .trusts
+                    .insert(id, TrustRecord { id, name, jurisdiction })
+                    .is_none()
+                {
                     delta.semantic_changes += 1;
                 }
             }
@@ -327,8 +359,22 @@ impl Oracle {
         delta
     }
 
+    pub fn register_identity_probe_pair(&mut self, a: PersonId, b: PersonId) {
+        if !self
+            .identity_probe_pairs
+            .iter()
+            .any(|&(x, y)| x == a && y == b)
+        {
+            self.identity_probe_pairs.push((a, b));
+        }
+    }
+
     pub fn total_churn(&self) -> &StateDelta {
         &self.total_churn
+    }
+
+    pub fn assertion_ids(&self) -> Vec<AssertionId> {
+        self.assertions.iter().map(|a| a.id).collect()
     }
 
     pub fn visible_assertions(
@@ -346,8 +392,39 @@ impl Oracle {
             .collect()
     }
 
-    /// Ground truth for Q9. Enumerates every relation instance the entity participates
-    /// in, across all relation types and arities, with the role it fills.
+    fn owners_of(&self, entity: EntityId, valid_at: Timestamp, known_at: Timestamp) -> Vec<EntityId> {
+        self.assertions
+            .iter()
+            .filter(|a| {
+                a.object == entity
+                    && a.predicate.starts_with("owns_")
+                    && a.evidence != EvidenceState::Refuted
+                    && a.bitemporal.visible_at(valid_at, known_at)
+            })
+            .map(|a| a.subject)
+            .collect()
+    }
+
+    fn collect_person_owners(
+        &self,
+        entity: EntityId,
+        valid_at: Timestamp,
+        known_at: Timestamp,
+        visited: &mut HashSet<EntityId>,
+        out: &mut HashSet<PersonId>,
+    ) {
+        if !visited.insert(entity) {
+            return;
+        }
+        for owner in self.owners_of(entity, valid_at, known_at) {
+            if let Some(p) = self.persons.keys().find(|p| p.entity() == owner) {
+                out.insert(*p);
+            } else if self.companies.contains_key(&CompanyId(owner.0)) {
+                self.collect_person_owners(owner, valid_at, known_at, visited, out);
+            }
+        }
+    }
+
     pub fn neighborhood(
         &self,
         entity: EntityId,
@@ -431,26 +508,9 @@ impl Oracle {
         valid_at: Timestamp,
         known_at: Timestamp,
     ) -> Vec<PersonId> {
+        let mut visited = HashSet::new();
         let mut owners = HashSet::new();
-        for a in self.visible_assertions(entity, valid_at, known_at) {
-            if a.predicate.starts_with("owns_") && a.evidence != EvidenceState::Refuted {
-                if let Some(p) = self.persons.keys().find(|p| p.entity() == a.subject) {
-                    owners.insert(*p);
-                }
-            }
-        }
-        // indirect via recursive ownership
-        for company in self.companies.keys() {
-            if self.ownership_path(company.entity(), entity, valid_at, known_at) {
-                for a in self.visible_assertions(company.entity(), valid_at, known_at) {
-                    if a.predicate.starts_with("owns_") && a.evidence != EvidenceState::Refuted {
-                        if let Some(p) = self.persons.keys().find(|p| p.entity() == a.subject) {
-                            owners.insert(*p);
-                        }
-                    }
-                }
-            }
-        }
+        self.collect_person_owners(entity, valid_at, known_at, &mut visited, &mut owners);
         let mut v: Vec<_> = owners.into_iter().collect();
         v.sort_by_key(|p| p.0);
         v
@@ -475,10 +535,8 @@ impl Oracle {
             if !visited.insert(current) {
                 continue;
             }
-            for a in self.visible_assertions(current, valid_at, known_at) {
-                if a.predicate.starts_with("owns_") && a.evidence != EvidenceState::Refuted {
-                    stack.push(a.object);
-                }
+            for owner in self.owners_of(current, valid_at, known_at) {
+                stack.push(owner);
             }
         }
         false
@@ -573,38 +631,40 @@ impl Oracle {
         valid_at: Timestamp,
         known_at: Timestamp,
     ) -> Result<Exposure> {
-        let mut direct = false;
-        let mut path = Vec::new();
+        let direct_owners = self.owners_of(entity, valid_at, known_at);
+        let direct = !direct_owners.is_empty();
+        let mut path: Vec<EntityId> = direct_owners.clone();
         let mut sanctioned_controller = None;
 
-        for a in self.visible_assertions(entity, valid_at, known_at) {
-            if a.predicate.starts_with("owns_") && a.evidence != EvidenceState::Refuted {
-                direct = true;
-                path.push(a.subject);
-                if let Some(p) = self.persons.keys().find(|p| p.entity() == a.subject) {
-                    if self.is_person_sanctioned(*p, valid_at, known_at) {
-                        sanctioned_controller = Some(*p);
-                    }
+        for owner in &direct_owners {
+            if let Some(p) = self.persons.keys().find(|p| p.entity() == *owner) {
+                if self.is_person_sanctioned(*p, valid_at, known_at) {
+                    sanctioned_controller = Some(*p);
                 }
             }
         }
 
         let mut indirect = false;
         for company in self.companies.keys() {
-            if self.ownership_path(company.entity(), entity, valid_at, known_at) {
-                for a in self.visible_assertions(company.entity(), valid_at, known_at) {
-                    if a.predicate.starts_with("owns_") && a.evidence != EvidenceState::Refuted {
-                        indirect = true;
-                        path.push(a.subject);
-                        if let Some(p) = self.persons.keys().find(|p| p.entity() == a.subject) {
-                            if self.is_person_sanctioned(*p, valid_at, known_at) {
-                                sanctioned_controller = Some(*p);
-                            }
+            let ce = company.entity();
+            if ce == entity {
+                continue;
+            }
+            if self.ownership_path(ce, entity, valid_at, known_at) {
+                for owner in self.owners_of(ce, valid_at, known_at) {
+                    indirect = true;
+                    path.push(owner);
+                    if let Some(p) = self.persons.keys().find(|p| p.entity() == owner) {
+                        if self.is_person_sanctioned(*p, valid_at, known_at) {
+                            sanctioned_controller = Some(*p);
                         }
                     }
                 }
             }
         }
+
+        path.sort();
+        path.dedup();
 
         Ok(Exposure {
             entity,
@@ -684,15 +744,15 @@ impl Oracle {
         valid_at: Timestamp,
         known_at: Timestamp,
     ) -> Result<Compatibility> {
-        let contexts = [Context::CorporateRegistry, Context::Kyc, Context::Sanctions];
+        let contexts = Context::base_contexts();
         let mut states: HashMap<Context, Vec<&Assertion>> = HashMap::new();
         for ctx in contexts {
             let assertions: Vec<_> = self
                 .visible_assertions(entity, valid_at, known_at)
                 .into_iter()
-                .filter(|a| a.context == ctx)
+                .filter(|a| a.context == *ctx)
                 .collect();
-            states.insert(ctx, assertions);
+            states.insert(*ctx, assertions);
         }
 
         let mut has_contradiction = false;
@@ -713,7 +773,6 @@ impl Oracle {
             }
         }
 
-        // cross-context check
         let cr = states.get(&Context::CorporateRegistry).cloned().unwrap_or_default();
         let kyc = states.get(&Context::Kyc).cloned().unwrap_or_default();
         let sanctions = states.get(&Context::Sanctions).cloned().unwrap_or_default();
@@ -786,7 +845,6 @@ impl Oracle {
     }
 
     pub fn build_expected(_probes: &[QueryProbe]) -> Result<Vec<(QueryProbe, ExpectedAnswer)>> {
-        let oracle = Oracle::new();
         Ok(vec![])
     }
 }
@@ -800,15 +858,22 @@ impl Oracle {
         oracle
     }
 
+    /// Anchor probe times to the fixture epoch so closed knowledge windows matter.
+    pub fn fixture_epoch(&self) -> Timestamp {
+        self.assertions
+            .first()
+            .map(|a| a.bitemporal.valid_from)
+            .unwrap_or_else(|| Utc::now() - Duration::days(365))
+    }
+
     pub fn generate_probes(&self, count: usize) -> Vec<QueryProbe> {
-        let now = Utc::now();
-        let valid_march_1 = now - Duration::days(30);
-        let known_march_10 = now - Duration::days(21);
+        let epoch = self.fixture_epoch();
+        let valid_at = epoch + Duration::days(200);
+        let known_historical = epoch + Duration::days(250);
+        let known_current = epoch + Duration::days(400);
+
         let mut probes = Vec::new();
 
-        // Sort before taking: HashMap iteration order is randomised per process, so an
-        // unsorted `take(count)` would select a different probe set on every run and make
-        // results incomparable across runs despite the fixed seed.
         let mut companies: Vec<EntityId> = self.companies.values().map(|c| c.id.entity()).collect();
         companies.sort();
         let mut person_entities: Vec<EntityId> =
@@ -821,29 +886,39 @@ impl Oracle {
             .take(count)
             .collect();
 
-        let mut persons: Vec<PersonId> = self.persons.keys().copied().collect();
-        persons.sort_by_key(|p| p.0);
-        persons.truncate(count);
+        let q4_pairs: Vec<(PersonId, PersonId)> = if self.identity_probe_pairs.is_empty() {
+            let mut persons: Vec<PersonId> = self.persons.keys().copied().collect();
+            persons.sort_by_key(|p| p.0);
+            persons
+                .windows(2)
+                .map(|w| (w[0], w[1]))
+                .take(count)
+                .collect()
+        } else {
+            self.identity_probe_pairs.clone()
+        };
 
         for (i, entity) in entities.iter().enumerate() {
             for family in QueryFamily::all() {
                 let mut probe = QueryProbe {
                     family: *family,
                     entity: *entity,
-                    valid_at: valid_march_1,
-                    known_at: known_march_10,
+                    valid_at,
+                    known_at: known_historical,
                     person_a: None,
                     person_b: None,
                 };
+
                 if *family == QueryFamily::Q4IdentityDiscrimination {
-                    if persons.len() >= 2 {
-                        probe.person_a = Some(persons[i % persons.len()]);
-                        probe.person_b = Some(persons[(i + 1) % persons.len()]);
+                    if let Some((a, b)) = q4_pairs.get(i % q4_pairs.len()) {
+                        probe.person_a = Some(*a);
+                        probe.person_b = Some(*b);
                     }
                 }
                 if *family == QueryFamily::Q8RetrospectiveView {
-                    probe.known_at = now;
+                    probe.known_at = known_current;
                 }
+
                 probes.push(probe);
             }
         }
@@ -865,32 +940,90 @@ impl Oracle {
 mod tests {
     use super::*;
     use crate::lattice::EvidenceState;
+    use chrono::TimeZone;
 
-    fn ts(days_ago: i64) -> Timestamp {
-        Utc::now() - Duration::days(days_ago)
+    fn ts(days: i64) -> Timestamp {
+        Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap() + Duration::days(days)
     }
 
     #[test]
-    fn oracle_beneficial_owner() {
+    fn oracle_beneficial_owner_deep_chain() {
+        let person = PersonId::new();
+        let mid = CompanyId::new();
+        let target = CompanyId::new();
+        let mut oracle = Oracle::new();
+        oracle.ingest(Event::RegisterPerson {
+            id: person,
+            name: "John Smith".into(),
+            canonical_name: "john smith".into(),
+            jurisdiction: "US".into(),
+            context: Context::Kyc,
+            at: ts(0),
+        });
+        for (c, name) in [(mid, "MidCo"), (target, "TargetCo")] {
+            oracle.ingest(Event::RegisterCompany {
+                id: c,
+                name: name.into(),
+                jurisdiction: "UK".into(),
+                at: ts(0),
+            });
+        }
+        for (owner, owned) in [
+            (PartyId::Person(person), mid),
+            (PartyId::Company(mid), target),
+        ] {
+            oracle.ingest(Event::AssertOwnership {
+                owner,
+                owned,
+                share_pct: 51.0,
+                evidence: EvidenceState::Supported,
+                governance: GovernanceLevel::Reviewed,
+                context: Context::CorporateRegistry,
+                role: Role::BeneficialOwner,
+                jurisdiction: "UK".into(),
+                provenance: Provenance {
+                    source_id: "reg1".into(),
+                    source_authority: 0.9,
+                    observed_at: ts(10),
+                },
+                bitemporal: Bitemporal {
+                    valid_from: ts(20),
+                    valid_to: None,
+                    known_from: ts(10),
+                    known_to: None,
+                },
+            });
+        }
+        let owners = oracle.beneficial_owners(target.entity(), ts(30), ts(50));
+        assert_eq!(owners, vec![person]);
+    }
+
+    #[test]
+    fn q7_q8_can_diverge_with_closed_knowledge() {
         let owner = PersonId::new();
         let company = CompanyId::new();
         let mut oracle = Oracle::new();
         oracle.ingest(Event::RegisterPerson {
             id: owner,
-            name: "John Smith".into(),
-            canonical_name: "john smith".into(),
+            name: "Jane Doe".into(),
+            canonical_name: "jane doe".into(),
             jurisdiction: "US".into(),
             context: Context::Kyc,
-            at: ts(100),
+            at: ts(0),
         });
         oracle.ingest(Event::RegisterCompany {
             id: company,
-            name: "Acme Ltd".into(),
+            name: "Acme".into(),
             jurisdiction: "UK".into(),
-            at: ts(100),
+            at: ts(0),
+        });
+        oracle.ingest(Event::ComplianceRule {
+            rule_id: "r0".into(),
+            description: "t".into(),
+            threshold_pct: 25.0,
         });
         oracle.ingest(Event::AssertOwnership {
-            owner,
+            owner: PartyId::Person(owner),
             owned: company,
             share_pct: 51.0,
             evidence: EvidenceState::Supported,
@@ -901,16 +1034,34 @@ mod tests {
             provenance: Provenance {
                 source_id: "reg1".into(),
                 source_authority: 0.9,
-                observed_at: ts(50),
+                observed_at: ts(10),
             },
             bitemporal: Bitemporal {
-                valid_from: ts(60),
+                valid_from: ts(20),
                 valid_to: None,
-                known_from: ts(50),
+                known_from: ts(10),
                 known_to: None,
             },
         });
-        let owners = oracle.beneficial_owners(company.entity(), ts(30), ts(10));
-        assert_eq!(owners, vec![owner]);
+        oracle.ingest(Event::SanctionListing {
+            person: owner,
+            list_name: "OFAC".into(),
+            listed: true,
+            context: Context::Sanctions,
+            bitemporal: Bitemporal {
+                valid_from: ts(50),
+                valid_to: None,
+                known_from: ts(300),
+                known_to: None,
+            },
+        });
+        let d7 = oracle
+            .compliance_decision(company.entity(), ts(100), ts(200))
+            .unwrap();
+        let d8 = oracle
+            .compliance_decision(company.entity(), ts(100), ts(350))
+            .unwrap();
+        assert_eq!(d7, Decision::Allow);
+        assert_eq!(d8, Decision::Block);
     }
 }
