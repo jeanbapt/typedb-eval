@@ -2,17 +2,17 @@
 
 ## 1. Hypothesis
 
-H0: PostgreSQL bien conçu permet d'implémenter le modèle sémantique gouverné avec performance et complexité acceptables.
+H0: A well-designed PostgreSQL can implement the governed semantic model with acceptable performance and complexity.
 
-H1: TypeDB apporte un avantage structurel sur les opérations combinant relations n-aires, polymorphisme, contradiction, temporalité, provenance et reconstruction contextuelle.
+H1: TypeDB provides a structural advantage on operations combining n-ary relations, polymorphism, contradiction, temporality, provenance, and contextual reconstruction.
 
 ## 2. What we tested
 
-- Domaine: KYB / sanctions / beneficial ownership simplifié
-- Requêtes: Q1–Q9 (lookup, bitemporal, contradictions, identité, ownership, compatibilité contextuelle, replay historique, vue rétrospective, traversée agnostique aux rôles)
-- Scales: S (1k), M (20k), L (200k conditionnel)
-- Ablation: 10 dimensions sémantiques candidates
-- Backends: PostgreSQL 16 (relationnel typé + GiST + recursive CTE) vs TypeDB 3.12 (schema PERA + TypeQL functions)
+- Domain: simplified KYB / sanctions / beneficial ownership
+- Queries: Q1–Q9 (lookup, bitemporal, contradictions, identity, ownership, context compatibility, historical replay, retrospective view, role-agnostic traversal)
+- Scales: S (1k), M (20k), L (200k conditional)
+- Ablation: 10 candidate semantic dimensions
+- Backends: PostgreSQL 16 (typed relational + GiST + recursive CTE) vs TypeDB 3.12 (PERA schema + TypeQL functions)
 
 ## 3. Results
 
@@ -29,14 +29,14 @@ Correctness breakdown (TypeDB, scale S):
 
 ## 4. Schema evolution (query-surface churn)
 
-Q9 (traversée agnostique aux rôles) est écrite une fois contre l'ontologie de base puis gelée. L'ontologie gagne ensuite un type de partie (`trust`) et une relation 4-aire (`control-via-nominee`), et la même requête inchangée est rejouée.
+Q9 (role-agnostic traversal) is written once against the base ontology and then frozen. The ontology gains a party kind (`trust`) and a 4-ary relation (`control-via-nominee`), and the same unchanged query is replayed.
 
-| Backend | Rappel (base) | Rappel (étendu, requête gelée) | Rappel (après réparation) | LOC de réparation |
-|---------|---------------|--------------------------------|---------------------------|-------------------|
+| Backend | Recall (base) | Recall (extended, frozen query) | Recall (after repair) | Repair LOC |
+|---------|---------------|----------------------------------|------------------------|------------|
 | postgres | 100.0% | 28.7% | 100.0% | 20 |
 | typedb | 100.0% | 100.0% | 100.0% | 0 |
 
-`postgres` perd `control-via-nominee` silencieusement : réponse plus petite, aucune erreur levée.
+Postgres silently loses `control-via-nominee`: smaller answer, no error raised.
 
 ## 5. Bitemporality — interpretation
 
@@ -59,7 +59,7 @@ Conclusion: bitemporal **semantics** work on TypeDB; bitemporal **query ergonomi
 
 ## 6. Where TypeDB wins
 
-- Schema evolution: postgres silently drops to 28.7% recall after an ontology extension and needs 20 LOC of query repair
+- Schema evolution: Postgres silently drops to 28.7% recall after an ontology extension and needs 20 LOC of query repair
 - Schema evolution: TypeDB keeps 100% recall through the extension with zero query edits (role-agnostic traversal)
 - Correctness (scale S): 98.3% vs 94.7% after alignment fixes — slight edge, not decisive alone
 - Semantic churn: lower ratio (1.01 vs 1.16)
@@ -73,16 +73,16 @@ Conclusion: bitemporal **semantics** work on TypeDB; bitemporal **query ergonomi
 
 ## 8. Architectural cost of TypeDB
 
-- Nouveau datastore à opérer (TypeDB Server 3.12)
-- Driver async Rust (`typedb-driver` 3.12)
-- Écosystème plus restreint que PostgreSQL
-- Backend Rust plus volumineux (1821 LOC vs 1270) due to client-side graph/bitemporal logic
+- New datastore to operate (TypeDB Server 3.12)
+- Async Rust driver (`typedb-driver` 3.12)
+- Smaller ecosystem than PostgreSQL
+- Larger Rust backend (1821 LOC vs 1270) due to client-side graph/bitemporal logic
 
 ## 9. Verdict
 
 **INVESTIGATE HYBRID**
 
-TypeDB apporte un avantage net sur l'évolution d'ontologie (Q9) et une légère edge correctness après corrections, mais reste ~73× plus lent sur scale S. PostgreSQL reste le choix par défaut pour la bitemporalité performante et l'exploitation. Investiguer un modèle hybride ciblé : Postgres pour le hot path bitemporal + TypeDB pour les surfaces ontologiques polymorphes si l'évolution de schéma est fréquente.
+TypeDB has a clear advantage on ontology evolution (Q9) and a slight correctness edge after fixes, but remains ~73× slower on scale S. PostgreSQL remains the default for performant bitemporal queries and operations. Investigate a targeted hybrid: Postgres for the bitemporal hot path + TypeDB for polymorphic ontology surfaces if schema evolution is frequent.
 
 ---
-*Généré et enrichi manuellement après run scale S seed 42. Voir results/summary.csv pour les métriques complètes.*
+*Updated after scale S run, seed 42. See results/summary.csv for full metrics.*
