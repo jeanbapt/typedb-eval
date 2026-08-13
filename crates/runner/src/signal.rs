@@ -25,7 +25,11 @@ pub fn load_schema_evolution_signal(out: &std::path::Path) -> Option<SchemaEvolu
     let mut held_recall = Vec::new();
     for b in &report.backends {
         let recall = b.extended_frozen.recall();
-        if recall < 0.999 || b.repair_loc > 0 {
+        // A backend "loses" the experiment only if the extension made its frozen query
+        // worse than its own base run, or it needed query repair. Comparing against an
+        // absolute cutoff instead would misattribute pre-existing base-generation gaps
+        // (unrelated to the extension) as evolution failures.
+        if b.repair_loc > 0 || recall + 1e-9 < b.base.recall() {
             lost_recall.push((b.backend.clone(), recall, b.repair_loc));
         } else {
             held_recall.push(b.backend.clone());
@@ -155,7 +159,7 @@ pub fn detect_signal_with(
         }
         if se.held_recall.iter().any(|b| b == "typedb") && !se.lost_recall.is_empty() {
             typedb_wins.push(
-                "Schema evolution: TypeDB keeps 100% recall through the extension with zero \
+                "Schema evolution: TypeDB keeps its recall through the extension with zero \
                  query edits (role-agnostic traversal)"
                     .into(),
             );
