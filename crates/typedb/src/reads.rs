@@ -257,8 +257,9 @@ static NEIGHBORHOOD_PAIRED_Q: LazyLock<String> = LazyLock::new(|| {
             not {{ $y is $x; }};
             $y has entity-id $yid;
             $r isa $rt;
+            try {{ $r has predicate-name $pred; }};
             {bt}
-        select $rt, $role, $yid;"#,
+        select $rt, $role, $yid, $pred;"#,
         bt = TypeDbReads::bitemporal_active("$r"),
     )
 });
@@ -270,8 +271,9 @@ static NEIGHBORHOOD_SOLO_Q: LazyLock<String> = LazyLock::new(|| {
             $x has entity-id == $eid;
             $r links ($role: $x);
             $r isa $rt;
+            try {{ $r has predicate-name $pred; }};
             {bt}
-        select $rt, $role;"#,
+        select $rt, $role, $pred;"#,
         bt = TypeDbReads::bitemporal_active("$r"),
     )
 });
@@ -770,14 +772,18 @@ impl<'a> TypeDbReads<'a> {
             .collect_named_rows_given(&NEIGHBORHOOD_PAIRED_Q, rows_evk(entity, valid_at, known_at))
             .await?
         {
-            let (rt, role) = (Self::col(&row, "rt"), Self::col(&row, "role"));
+            let (rt, role) = Self::oracle_edge_kind(
+                &Self::col(&row, "rt"),
+                &Self::col(&row, "role"),
+                &Self::col(&row, "pred"),
+            );
             let Some(counterparty) = Self::parse_uuid(&Self::col(&row, "yid")) else {
                 continue;
             };
             paired_kinds.insert((rt.clone(), role.clone()));
             edges.push(NeighborEdge {
-                relation_type: Self::normalise_type(&rt),
-                role: Self::normalise_type(&role),
+                relation_type: rt,
+                role,
                 counterparty: Some(EntityId::from_uuid(counterparty)),
             });
         }
@@ -787,13 +793,17 @@ impl<'a> TypeDbReads<'a> {
             .collect_named_rows_given(&NEIGHBORHOOD_SOLO_Q, rows_evk(entity, valid_at, known_at))
             .await?
         {
-            let (rt, role) = (Self::col(&row, "rt"), Self::col(&row, "role"));
+            let (rt, role) = Self::oracle_edge_kind(
+                &Self::col(&row, "rt"),
+                &Self::col(&row, "role"),
+                &Self::col(&row, "pred"),
+            );
             if paired_kinds.contains(&(rt.clone(), role.clone())) {
                 continue;
             }
             edges.push(NeighborEdge {
-                relation_type: Self::normalise_type(&rt),
-                role: Self::normalise_type(&role),
+                relation_type: rt,
+                role,
                 counterparty: None,
             });
         }
@@ -809,6 +819,29 @@ impl<'a> TypeDbReads<'a> {
     /// names so that both backends speak the same vocabulary.
     fn normalise_type(label: &str) -> String {
         label.rsplit(':').next().unwrap_or(label).trim().to_string()
+    }
+
+    /// Map a raw (relation type, role, predicate) row onto the oracle's edge vocabulary.
+    ///
+    /// The oracle classifies any assertion whose predicate starts with `owns_` as an
+    /// `ownership` edge with `owner`/`owned` roles, regardless of how it is stored; the
+    /// Postgres frozen Q9 applies the same `predicate LIKE 'owns_%'` normalization in
+    /// SQL. This is vocabulary alignment (like `normalise_type` above), not relation-type
+    /// enumeration: the query still matches relations role-agnostically and only reads an
+    /// optional attribute.
+    fn oracle_edge_kind(rt: &str, role: &str, pred: &str) -> (String, String) {
+        let rt = Self::normalise_type(rt);
+        let role = Self::normalise_type(role);
+        if rt == "generic-assertion" && pred.starts_with("owns_") {
+            let role = match role.as_str() {
+                "subject" => "owner".to_string(),
+                "object" => "owned".to_string(),
+                other => other.to_string(),
+            };
+            ("ownership".to_string(), role)
+        } else {
+            (rt, role)
+        }
     }
 
     fn parse_uuid(s: &str) -> Option<Uuid> {
