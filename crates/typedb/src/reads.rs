@@ -1,6 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::LazyLock;
 use futures::StreamExt;
-use typedb_driver::{answer::QueryAnswer, concept::Concept, TransactionType, TypeDBDriver};
+use typedb_driver::{
+    answer::QueryAnswer,
+    concept::Concept,
+    given::{GivenRowEntry, GivenRows},
+    TransactionType, TypeDBDriver,
+};
 
 use benchmark_core::error::Result;
 use benchmark_core::{
@@ -14,16 +20,8 @@ use uuid::Uuid;
 const DATETIME_FMT: &str = "%Y-%m-%dT%H:%M:%S";
 
 #[derive(Clone, Debug)]
-struct ActiveOwnership {
-    owner: EntityId,
-    owned: EntityId,
-    evidence: EvidenceState,
-}
-
-#[derive(Clone, Debug)]
 struct VisibleAssertion {
     id: AssertionId,
-    subject: EntityId,
     predicate: String,
     object: EntityId,
     evidence: EvidenceState,
@@ -36,66 +34,262 @@ pub struct TypeDbReads<'a> {
     pub database: &'a str,
 }
 
+/// `given` prologue shared by every parameterized read: the probe entity and the
+/// two bitemporal instants. Keeping the query text itself constant lets the server's
+/// 3.12.2 parse/translation/compile caches (keyed on the exact query string) hit on
+/// every call; only the given rows change.
+const GIVEN_EVK: &str = "given $eid: string, $valid: datetime, $known: datetime;";
+
+/// One row binding `$eid`, `$valid`, `$known`.
+fn rows_evk(entity: EntityId, valid_at: Timestamp, known_at: Timestamp) -> GivenRows {
+    let mut rows = GivenRows::new(
+        vec!["eid".to_string(), "valid".to_string(), "known".to_string()],
+        1,
+    );
+    rows.push_row(vec![
+        GivenRowEntry::from(entity.0.to_string()),
+        GivenRowEntry::from(valid_at.naive_utc()),
+        GivenRowEntry::from(known_at.naive_utc()),
+    ])
+    .expect("given row width");
+    rows
+}
+
+/// One row binding a single `$eid`.
+fn rows_eid(entity: Uuid) -> GivenRows {
+    let mut rows = GivenRows::new(vec!["eid".to_string()], 1);
+    rows.push_row(vec![GivenRowEntry::from(entity.to_string())])
+        .expect("given row width");
+    rows
+}
+
+static OWNERSHIP_OWNED_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $x has entity-id == $eid;
+            $o isa ownership, links (owner: $owner, owned: $x);
+            $owner has entity-id $sid;
+            $o has share-pct $sp, has evidence-state $ev, has context-type $ctx;
+            not {{ $ev == "REFUTED"; }};
+            {bt}
+            try {{ $o has assertion-id $aid; }};
+        select $sid, $sp, $ev, $ctx, $vf, $aid;"#,
+        bt = TypeDbReads::bitemporal_active("$o"),
+    )
+});
+
+static OWNERSHIP_OWNER_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $x has entity-id == $eid;
+            $o isa ownership, links (owner: $x, owned: $owned);
+            $owned has entity-id $oid;
+            $o has share-pct $sp, has evidence-state $ev, has context-type $ctx;
+            not {{ $ev == "REFUTED"; }};
+            {bt}
+            try {{ $o has assertion-id $aid; }};
+        select $oid, $sp, $ev, $ctx, $vf, $aid;"#,
+        bt = TypeDbReads::bitemporal_active("$o"),
+    )
+});
+
+static GENERIC_SUBJECT_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $x has entity-id == $eid;
+            $a isa generic-assertion, links (subject: $x, object: $o);
+            $o has entity-id $oid;
+            $a has predicate-name $pred, has evidence-state $ev, has context-type $ctx;
+            not {{ $ev == "REFUTED"; }};
+            {bt}
+            try {{ $a has assertion-id $aid; }};
+        select $pred, $oid, $ev, $ctx, $vf, $aid;"#,
+        bt = TypeDbReads::bitemporal_active("$a"),
+    )
+});
+
+static GENERIC_OBJECT_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $x has entity-id == $eid;
+            $a isa generic-assertion, links (subject: $s, object: $x);
+            $s has entity-id $sid;
+            $a has predicate-name $pred, has evidence-state $ev, has context-type $ctx;
+            not {{ $ev == "REFUTED"; }};
+            {bt}
+            try {{ $a has assertion-id $aid; }};
+        select $pred, $sid, $ev, $ctx, $vf, $aid;"#,
+        bt = TypeDbReads::bitemporal_active("$a"),
+    )
+});
+
+static BENEFICIAL_OWNERS_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $target isa company, has entity-id == $eid;
+            let $p in transitive-owner-persons($target, $valid, $known);
+            $p has entity-id $pid;
+        select $pid;"#
+    )
+});
+
+static EXPO_DIRECT_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $target isa company, has entity-id == $eid;
+            {{ let $d in active-company-owners($target, $valid, $known); }}
+            or {{ let $d in active-person-owners($target, $valid, $known); }};
+            $d has entity-id $did;
+        select $did;"#
+    )
+});
+
+static EXPO_SUBS_COMPANY_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $root isa company, has entity-id == $eid;
+            let $ce in transitive-owned-companies($root, $valid, $known);
+            not {{ $ce has entity-id == $eid; }};
+            {{ let $co in active-company-owners($ce, $valid, $known); }}
+            or {{ let $co in active-person-owners($ce, $valid, $known); }};
+            $co has entity-id $coid;
+        select $coid;"#
+    )
+});
+
+static EXPO_SUBS_PERSON_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $rootp isa person, has entity-id == $eid;
+            {{ let $ce in active-owned-companies-of-person($rootp, $valid, $known); }}
+            or {{
+                let $c0 in active-owned-companies-of-person($rootp, $valid, $known);
+                let $ce in transitive-owned-companies($c0, $valid, $known);
+            }};
+            {{ let $co in active-company-owners($ce, $valid, $known); }}
+            or {{ let $co in active-person-owners($ce, $valid, $known); }};
+            $co has entity-id $coid;
+        select $coid;"#
+    )
+});
+
+static EXPO_SANCTIONED_COMPANY_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $target isa company, has entity-id == $eid;
+            {{
+                let $p in active-person-owners($target, $valid, $known);
+            }} or {{
+                let $ce in transitive-owned-companies($target, $valid, $known);
+                not {{ $ce has entity-id == $eid; }};
+                let $p in active-person-owners($ce, $valid, $known);
+            }};
+            $p has entity-id $pid;
+            $s isa sanction-listing, links (sanctioned-person: $p);
+            {bt}
+            $s has listed-flag true;
+        select $pid;"#,
+        bt = TypeDbReads::bitemporal_active("$s"),
+    )
+});
+
+static EXPO_SANCTIONED_PERSON_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $rootp isa person, has entity-id == $eid;
+            {{ let $ce in active-owned-companies-of-person($rootp, $valid, $known); }}
+            or {{
+                let $c0 in active-owned-companies-of-person($rootp, $valid, $known);
+                let $ce in transitive-owned-companies($c0, $valid, $known);
+            }};
+            let $p in active-person-owners($ce, $valid, $known);
+            $p has entity-id $pid;
+            $s isa sanction-listing, links (sanctioned-person: $p);
+            {bt}
+            $s has listed-flag true;
+        select $pid;"#,
+        bt = TypeDbReads::bitemporal_active("$s"),
+    )
+});
+
+const IDENTITY_NAMES_Q: &str = r#"given $a: string, $b: string;
+    match
+        $p1 isa person, has entity-id == $a, has canonical-name $c1;
+        $p2 isa person, has entity-id == $b, has canonical-name $c2;
+    select $c1, $c2;"#;
+
+const IDENTITY_MERGE_Q: &str = r#"given $eid: string;
+    match
+        $p isa person, has entity-id == $eid;
+        $l isa identity-link, links (linked-person: $p), has merge-flag true;
+    select $l;"#;
+
+static IS_SANCTIONED_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $p isa person, has entity-id == $eid;
+            $s isa sanction-listing, links (sanctioned-person: $p);
+            {bt}
+            $s has listed-flag true;
+        select $vf;"#,
+        bt = TypeDbReads::bitemporal_active("$s"),
+    )
+});
+
+static NEIGHBORHOOD_PAIRED_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $x has entity-id == $eid;
+            $r links ($role: $x);
+            $r links ($orole: $y);
+            not {{ $y is $x; }};
+            $y has entity-id $yid;
+            $r isa $rt;
+            {bt}
+        select $rt, $role, $yid;"#,
+        bt = TypeDbReads::bitemporal_active("$r"),
+    )
+});
+
+static NEIGHBORHOOD_SOLO_Q: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        r#"{GIVEN_EVK}
+        match
+            $x has entity-id == $eid;
+            $r links ($role: $x);
+            $r isa $rt;
+            {bt}
+        select $rt, $role;"#,
+        bt = TypeDbReads::bitemporal_active("$r"),
+    )
+});
+
 impl<'a> TypeDbReads<'a> {
-    pub fn dt(t: Timestamp) -> String {
-        t.format(DATETIME_FMT).to_string()
-    }
-
-    pub fn bitemporal_start(rel: &str, valid: &str, known: &str, suffix: &str) -> String {
+    /// Full bitemporal visibility, evaluated server-side against the `given` instants
+    /// `$valid` and `$known`. An interval is active when it started at or before the
+    /// probe instant and no upper bound at or before that instant exists — the
+    /// negations make "absent attribute = open interval" a query predicate instead of
+    /// a Rust post-filter.
+    pub fn bitemporal_active(rel: &str) -> String {
         format!(
-            r#"{rel} has valid-from $vf{suffix}, has known-from $kf{suffix};
-                $vf{suffix} <= {valid};
-                $kf{suffix} <= {known};
-                try {{ {rel} has valid-to $vt{suffix}; }};
-                try {{ {rel} has known-to $kt{suffix}; }};"#
+            r#"{rel} has valid-from $vf, has known-from $kf;
+                $vf <= $valid;
+                $kf <= $known;
+                not {{ {rel} has valid-to $vt; $vt <= $valid; }};
+                not {{ {rel} has known-to $kt; $kt <= $known; }};"#
         )
-    }
-
-    pub fn bitemporal_start_active(rel: &str, valid: &str, known: &str, suffix: &str) -> String {
-        format!(
-            r#"{rel} has valid-from $vf{suffix}, has known-from $kf{suffix}, has evidence-state $ev{suffix};
-                $vf{suffix} <= {valid};
-                $kf{suffix} <= {known};
-                not {{ $ev{suffix} == "REFUTED"; }};
-                try {{ {rel} has valid-to $vt{suffix}; }};
-                try {{ {rel} has known-to $kt{suffix}; }};"#
-        )
-    }
-
-    fn parse_dt(s: &str) -> Option<chrono::NaiveDateTime> {
-        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S").ok()
-    }
-
-    fn interval_open(end: Option<&str>, at: &str) -> bool {
-        match end {
-            None | Some("") => true,
-            Some(end) => Self::parse_dt(end)
-                .zip(Self::parse_dt(at))
-                .map(|(e, a)| e > a)
-                .unwrap_or_else(|| {
-                    // Falling back to "open" here is what previously made every closed
-                    // interval invisible to the filter; keep the lenient behaviour but
-                    // make it impossible for it to happen silently again.
-                    tracing::warn!(%end, %at, "unparseable bitemporal bound, treating as open");
-                    true
-                }),
-        }
-    }
-
-    fn row_is_active(
-        _vf: &str,
-        vt: &str,
-        _kf: &str,
-        kt: &str,
-        ev: Option<&str>,
-        valid: &str,
-        known: &str,
-    ) -> bool {
-        if ev == Some("REFUTED") {
-            return false;
-        }
-        Self::interval_open(if vt.is_empty() { None } else { Some(vt) }, valid)
-            && Self::interval_open(if kt.is_empty() { None } else { Some(kt) }, known)
     }
 
     fn parse_evidence(s: &str) -> EvidenceState {
@@ -121,208 +315,21 @@ impl<'a> TypeDbReads<'a> {
             })
     }
 
-    async fn party_sets(&self) -> Result<(HashSet<EntityId>, HashSet<EntityId>)> {
-        let mut persons = HashSet::new();
-        for row in self
-            .collect_named_rows(r#"match $p isa person, has entity-id $id; select $id;"#)
-            .await?
-        {
-            if let Some(id) = row.get("id").and_then(|s| Uuid::parse_str(s).ok()) {
-                persons.insert(EntityId(id));
-            }
-        }
-        let mut companies = HashSet::new();
-        for row in self
-            .collect_named_rows(r#"match $c isa company, has entity-id $id; select $id;"#)
-            .await?
-        {
-            if let Some(id) = row.get("id").and_then(|s| Uuid::parse_str(s).ok()) {
-                companies.insert(EntityId(id));
-            }
-        }
-        Ok((persons, companies))
-    }
-
-    async fn active_ownerships(
-        &self,
-        valid_at: Timestamp,
-        known_at: Timestamp,
-    ) -> Result<Vec<ActiveOwnership>> {
-        let valid = Self::dt(valid_at);
-        let known = Self::dt(known_at);
-        let query = format!(
-            r#"match
-                $o isa ownership, links (owner: $owner, owned: $owned);
-                $owner has entity-id $oid;
-                $owned has entity-id $ownedid;
-                $o has valid-from $vf, has known-from $kf, has evidence-state $ev;
-                $vf <= {valid};
-                $kf <= {known};
-                try {{ $o has valid-to $vt; }};
-                try {{ $o has known-to $kt; }};
-            select $oid, $ownedid, $ev, $vf, $vt, $kf, $kt;"#,
-            valid = valid,
-            known = known,
-        );
-        Ok(self
-            .collect_named_rows(&query)
-            .await?
-            .into_iter()
-            .filter(|row| {
-                Self::row_is_active(
-                    row.get("vf").map(String::as_str).unwrap_or(""),
-                    row.get("vt").map(String::as_str).unwrap_or(""),
-                    row.get("kf").map(String::as_str).unwrap_or(""),
-                    row.get("kt").map(String::as_str).unwrap_or(""),
-                    row.get("ev").map(String::as_str),
-                    &valid,
-                    &known,
-                )
-            })
-            .filter_map(|row| {
-                Some(ActiveOwnership {
-                    owner: EntityId::from_uuid(
-                        Uuid::parse_str(row.get("oid")?).ok()?,
-                    ),
-                    owned: EntityId::from_uuid(
-                        Uuid::parse_str(row.get("ownedid")?).ok()?,
-                    ),
-                    evidence: Self::parse_evidence(row.get("ev")?),
-                })
-            })
-            .collect())
-    }
-
-    fn owners_of(edges: &[ActiveOwnership], entity: EntityId) -> Vec<EntityId> {
-        edges
-            .iter()
-            .filter(|e| e.owned == entity && e.evidence != EvidenceState::Refuted)
-            .map(|e| e.owner)
-            .collect()
-    }
-
-    fn ownership_path(edges: &[ActiveOwnership], from: EntityId, to: EntityId) -> bool {
-        if from == to {
-            return true;
-        }
-        let mut visited = HashSet::new();
-        let mut stack = vec![from];
-        while let Some(current) = stack.pop() {
-            if current == to {
-                return true;
-            }
-            if !visited.insert(current) {
-                continue;
-            }
-            for owner in Self::owners_of(edges, current) {
-                stack.push(owner);
-            }
-        }
-        false
-    }
-
-    fn collect_person_owners(
-        edges: &[ActiveOwnership],
-        entity: EntityId,
-        persons: &HashSet<EntityId>,
-        companies: &HashSet<EntityId>,
-        visited: &mut HashSet<EntityId>,
-        out: &mut HashSet<PersonId>,
-    ) {
-        if !visited.insert(entity) {
-            return;
-        }
-        for owner in Self::owners_of(edges, entity) {
-            if persons.contains(&owner) {
-                out.insert(PersonId(owner.0));
-            } else if companies.contains(&owner) {
-                Self::collect_person_owners(edges, owner, persons, companies, visited, out);
-            }
-        }
-    }
-
-    fn oracle_exposure(
-        edges: &[ActiveOwnership],
-        entity: EntityId,
-        persons: &HashSet<EntityId>,
-        companies: &HashSet<EntityId>,
-    ) -> Exposure {
-        let direct_owners = Self::owners_of(edges, entity);
-        let direct = !direct_owners.is_empty();
-        let mut path = direct_owners.clone();
-        let mut indirect = false;
-
-        for company in companies {
-            let ce = *company;
-            if ce == entity {
-                continue;
-            }
-            if Self::ownership_path(edges, ce, entity) {
-                for owner in Self::owners_of(edges, ce) {
-                    indirect = true;
-                    path.push(owner);
-                }
-            }
-        }
-
-        path.sort_by_key(|e| e.0);
-        path.dedup();
-
-        Exposure {
-            entity,
-            direct,
-            indirect,
-            path,
-            sanctioned_controller: None,
-        }
-    }
-
     async fn visible_assertions(
         &self,
         entity: EntityId,
         valid_at: Timestamp,
         known_at: Timestamp,
     ) -> Result<Vec<VisibleAssertion>> {
-        let valid = Self::dt(valid_at);
-        let known = Self::dt(known_at);
-        let eid = entity.0;
         let mut out = Vec::new();
 
-        let ownership_owned_q = format!(
-            r#"match
-                $x has entity-id "{eid}";
-                $o isa ownership, links (owner: $owner, owned: $x);
-                $owner has entity-id $sid;
-                $o has share-pct $sp, has evidence-state $ev, has context-type $ctx;
-                $o has valid-from $vf, has known-from $kf;
-                $vf <= {valid};
-                $kf <= {known};
-                try {{ $o has valid-to $vt; }};
-                try {{ $o has known-to $kt; }};
-                try {{ $o has assertion-id $aid; }};
-            select $sid, $sp, $ev, $ctx, $vf, $vt, $kf, $kt, $aid;"#,
-            valid = valid,
-            known = known,
-        );
-        for row in self.collect_named_rows(&ownership_owned_q).await? {
-            if !Self::row_is_active(
-                row.get("vf").map(String::as_str).unwrap_or(""),
-                row.get("vt").map(String::as_str).unwrap_or(""),
-                row.get("kf").map(String::as_str).unwrap_or(""),
-                row.get("kt").map(String::as_str).unwrap_or(""),
-                row.get("ev").map(String::as_str),
-                &valid,
-                &known,
-            ) {
+        for row in self
+            .collect_named_rows_given(&OWNERSHIP_OWNED_Q, rows_evk(entity, valid_at, known_at))
+            .await?
+        {
+            if row.get("sid").and_then(|s| Uuid::parse_str(s).ok()).is_none() {
                 continue;
             }
-            let Some(subject) = row
-                .get("sid")
-                .and_then(|s| Uuid::parse_str(s).ok())
-                .map(EntityId)
-            else {
-                continue;
-            };
             let share: f32 = row
                 .get("sp")
                 .and_then(|s| s.parse().ok())
@@ -338,7 +345,6 @@ impl<'a> TypeDbReads<'a> {
                 .unwrap_or_else(|| AssertionId::new());
             out.push(VisibleAssertion {
                 id,
-                subject,
                 predicate: format!("owns_{share}"),
                 object: entity,
                 evidence: Self::parse_evidence(row.get("ev").map(String::as_str).unwrap_or("")),
@@ -347,34 +353,10 @@ impl<'a> TypeDbReads<'a> {
             });
         }
 
-        let ownership_owner_q = format!(
-            r#"match
-                $x has entity-id "{eid}";
-                $o isa ownership, links (owner: $x, owned: $owned);
-                $owned has entity-id $oid;
-                $o has share-pct $sp, has evidence-state $ev, has context-type $ctx;
-                $o has valid-from $vf, has known-from $kf;
-                $vf <= {valid};
-                $kf <= {known};
-                try {{ $o has valid-to $vt; }};
-                try {{ $o has known-to $kt; }};
-                try {{ $o has assertion-id $aid; }};
-            select $oid, $sp, $ev, $ctx, $vf, $vt, $kf, $kt, $aid;"#,
-            valid = valid,
-            known = known,
-        );
-        for row in self.collect_named_rows(&ownership_owner_q).await? {
-            if !Self::row_is_active(
-                row.get("vf").map(String::as_str).unwrap_or(""),
-                row.get("vt").map(String::as_str).unwrap_or(""),
-                row.get("kf").map(String::as_str).unwrap_or(""),
-                row.get("kt").map(String::as_str).unwrap_or(""),
-                row.get("ev").map(String::as_str),
-                &valid,
-                &known,
-            ) {
-                continue;
-            }
+        for row in self
+            .collect_named_rows_given(&OWNERSHIP_OWNER_Q, rows_evk(entity, valid_at, known_at))
+            .await?
+        {
             let Some(object) = row
                 .get("oid")
                 .and_then(|s| Uuid::parse_str(s).ok())
@@ -397,7 +379,6 @@ impl<'a> TypeDbReads<'a> {
                 .unwrap_or_else(|| AssertionId::new());
             out.push(VisibleAssertion {
                 id,
-                subject: entity,
                 predicate: format!("owns_{share}"),
                 object,
                 evidence: Self::parse_evidence(row.get("ev").map(String::as_str).unwrap_or("")),
@@ -406,34 +387,10 @@ impl<'a> TypeDbReads<'a> {
             });
         }
 
-        let generic_subject_q = format!(
-            r#"match
-                $x has entity-id "{eid}";
-                $a isa generic-assertion, links (subject: $x, object: $o);
-                $o has entity-id $oid;
-                $a has predicate-name $pred, has evidence-state $ev, has context-type $ctx;
-                $a has valid-from $vf, has known-from $kf;
-                $vf <= {valid};
-                $kf <= {known};
-                try {{ $a has valid-to $vt; }};
-                try {{ $a has known-to $kt; }};
-                try {{ $a has assertion-id $aid; }};
-            select $pred, $oid, $ev, $ctx, $vf, $vt, $kf, $kt, $aid;"#,
-            valid = valid,
-            known = known,
-        );
-        for row in self.collect_named_rows(&generic_subject_q).await? {
-            if !Self::row_is_active(
-                row.get("vf").map(String::as_str).unwrap_or(""),
-                row.get("vt").map(String::as_str).unwrap_or(""),
-                row.get("kf").map(String::as_str).unwrap_or(""),
-                row.get("kt").map(String::as_str).unwrap_or(""),
-                row.get("ev").map(String::as_str),
-                &valid,
-                &known,
-            ) {
-                continue;
-            }
+        for row in self
+            .collect_named_rows_given(&GENERIC_SUBJECT_Q, rows_evk(entity, valid_at, known_at))
+            .await?
+        {
             let Some(object) = row
                 .get("oid")
                 .and_then(|s| Uuid::parse_str(s).ok())
@@ -452,7 +409,6 @@ impl<'a> TypeDbReads<'a> {
                 .unwrap_or_else(|| AssertionId::new());
             out.push(VisibleAssertion {
                 id,
-                subject: entity,
                 predicate: row.get("pred").cloned().unwrap_or_default(),
                 object,
                 evidence: Self::parse_evidence(row.get("ev").map(String::as_str).unwrap_or("")),
@@ -461,41 +417,13 @@ impl<'a> TypeDbReads<'a> {
             });
         }
 
-        let generic_object_q = format!(
-            r#"match
-                $x has entity-id "{eid}";
-                $a isa generic-assertion, links (subject: $s, object: $x);
-                $s has entity-id $sid;
-                $a has predicate-name $pred, has evidence-state $ev, has context-type $ctx;
-                $a has valid-from $vf, has known-from $kf;
-                $vf <= {valid};
-                $kf <= {known};
-                try {{ $a has valid-to $vt; }};
-                try {{ $a has known-to $kt; }};
-                try {{ $a has assertion-id $aid; }};
-            select $pred, $sid, $ev, $ctx, $vf, $vt, $kf, $kt, $aid;"#,
-            valid = valid,
-            known = known,
-        );
-        for row in self.collect_named_rows(&generic_object_q).await? {
-            if !Self::row_is_active(
-                row.get("vf").map(String::as_str).unwrap_or(""),
-                row.get("vt").map(String::as_str).unwrap_or(""),
-                row.get("kf").map(String::as_str).unwrap_or(""),
-                row.get("kt").map(String::as_str).unwrap_or(""),
-                row.get("ev").map(String::as_str),
-                &valid,
-                &known,
-            ) {
+        for row in self
+            .collect_named_rows_given(&GENERIC_OBJECT_Q, rows_evk(entity, valid_at, known_at))
+            .await?
+        {
+            if row.get("sid").and_then(|s| Uuid::parse_str(s).ok()).is_none() {
                 continue;
             }
-            let Some(subject) = row
-                .get("sid")
-                .and_then(|s| Uuid::parse_str(s).ok())
-                .map(EntityId)
-            else {
-                continue;
-            };
             let valid_from = row
                 .get("vf")
                 .and_then(|s| Self::parse_row_timestamp(s))
@@ -507,7 +435,6 @@ impl<'a> TypeDbReads<'a> {
                 .unwrap_or_else(|| AssertionId::new());
             out.push(VisibleAssertion {
                 id,
-                subject,
                 predicate: row.get("pred").cloned().unwrap_or_default(),
                 object: entity,
                 evidence: Self::parse_evidence(row.get("ev").map(String::as_str).unwrap_or("")),
@@ -609,19 +536,24 @@ impl<'a> TypeDbReads<'a> {
         conflicts
     }
 
+    /// Beneficial owners via the schema-level left-recursive TypeQL function:
+    /// recursion and bitemporal edge filtering both run inside the server.
     pub async fn beneficial_owners(
         &self,
         entity: EntityId,
         valid_at: Timestamp,
         known_at: Timestamp,
     ) -> Result<Vec<PersonId>> {
-        let (persons, companies) = self.party_sets().await?;
-        let edges = self.active_ownerships(valid_at, known_at).await?;
-        let mut out = HashSet::new();
-        let mut visited = HashSet::new();
-        Self::collect_person_owners(&edges, entity, &persons, &companies, &mut visited, &mut out);
-        let mut owners: Vec<PersonId> = out.into_iter().collect();
+        let mut owners: Vec<PersonId> = self
+            .collect_named_rows_given(&BENEFICIAL_OWNERS_Q, rows_evk(entity, valid_at, known_at))
+            .await?
+            .into_iter()
+            .filter_map(|row| {
+                Some(PersonId(Uuid::parse_str(row.get("pid")?).ok()?))
+            })
+            .collect();
         owners.sort_by_key(|p| p.0);
+        owners.dedup();
         Ok(owners)
     }
 
@@ -651,26 +583,67 @@ impl<'a> TypeDbReads<'a> {
         Ok(Self::oracle_contradictions(&assertions))
     }
 
+    /// Exposure via the schema-level functions: direct owners, co-owners of every
+    /// company the entity transitively owns, and sanctioned persons on that path all
+    /// come back from three queries whose recursion and bitemporal filtering run
+    /// inside the server.
     pub async fn ownership_exposure(
         &self,
         entity: EntityId,
         valid_at: Timestamp,
         known_at: Timestamp,
     ) -> Result<Exposure> {
-        let (persons, companies) = self.party_sets().await?;
-        let edges = self.active_ownerships(valid_at, known_at).await?;
-        let mut exposure = Self::oracle_exposure(&edges, entity, &persons, &companies);
+        let direct_owners: Vec<EntityId> = self
+            .collect_named_rows_given(&EXPO_DIRECT_Q, rows_evk(entity, valid_at, known_at))
+            .await?
+            .into_iter()
+            .filter_map(|row| Some(EntityId(Uuid::parse_str(row.get("did")?).ok()?)))
+            .collect();
 
-        for owner in &exposure.path.clone() {
-            if persons.contains(owner)
-                && self.is_sanctioned(*owner, valid_at, known_at).await?
-            {
-                exposure.sanctioned_controller = Some(PersonId(owner.0));
-                break;
-            }
+        // Companies the entity transitively owns, and their other direct owners.
+        // Mirrors the oracle: for every company reachable downward from the entity,
+        // each of its active owners joins the exposure path. Walking down from the
+        // fixed root keeps tabled recursion to a single table per probe. The root
+        // binding must stay linear (outside any disjunction): the planner rejects a
+        // variable bound by `isa` inside a branch being passed to a function in that
+        // same branch, so company and person roots are two queries.
+        let mut co_owners: Vec<EntityId> = Vec::new();
+        for query in [&*EXPO_SUBS_COMPANY_Q, &*EXPO_SUBS_PERSON_Q] {
+            co_owners.extend(
+                self.collect_named_rows_given(query, rows_evk(entity, valid_at, known_at))
+                    .await?
+                    .into_iter()
+                    .filter_map(|row| Some(EntityId(Uuid::parse_str(row.get("coid")?).ok()?))),
+            );
         }
 
-        Ok(exposure)
+        let direct = !direct_owners.is_empty();
+        let indirect = !co_owners.is_empty();
+        let mut path = direct_owners;
+        path.extend(co_owners);
+        path.sort_by_key(|e| e.0);
+        path.dedup();
+
+        // First (lowest-uuid) sanctioned person on the path. Same split as above:
+        // one query per root kind, then min over the union.
+        let mut sanctioned: Vec<Uuid> = Vec::new();
+        for query in [&*EXPO_SANCTIONED_COMPANY_Q, &*EXPO_SANCTIONED_PERSON_Q] {
+            sanctioned.extend(
+                self.collect_named_rows_given(query, rows_evk(entity, valid_at, known_at))
+                    .await?
+                    .into_iter()
+                    .filter_map(|row| Uuid::parse_str(row.get("pid")?).ok()),
+            );
+        }
+        let sanctioned_controller = sanctioned.into_iter().min().map(PersonId);
+
+        Ok(Exposure {
+            entity,
+            direct,
+            indirect,
+            path,
+            sanctioned_controller,
+        })
     }
 
     pub async fn compliance_decision(
@@ -723,34 +696,30 @@ impl<'a> TypeDbReads<'a> {
         _valid_at: Timestamp,
         _known_at: Timestamp,
     ) -> Result<IdentityAction> {
-        let a = person_a.0;
-        let b = person_b.0;
+        let mut name_rows = GivenRows::new(vec!["a".to_string(), "b".to_string()], 1);
+        name_rows
+            .push_row(vec![
+                GivenRowEntry::from(person_a.0.to_string()),
+                GivenRowEntry::from(person_b.0.to_string()),
+            ])
+            .expect("given row width");
+        let rows = self
+            .collect_named_rows_given(IDENTITY_NAMES_Q, name_rows)
+            .await?;
+        let (canon_a, canon_b) = rows
+            .first()
+            .map(|r| (Self::col(r, "c1"), Self::col(r, "c2")))
+            .unwrap_or_default();
 
-        let query = format!(
-            r#"match
-                $p1 isa person, has entity-id "{a}", has canonical-name $c1;
-                $p2 isa person, has entity-id "{b}", has canonical-name $c2;
-            select $c1, $c2;"#
-        );
-
-        let rows = self.collect_rows(&query).await?;
-        let (canon_a, canon_b) = rows.first().map(|r| (r.0.clone(), r.1.clone())).unwrap_or_default();
-
-        let merge_q = format!(
-            r#"match
-                $p isa person, has entity-id "{a}";
-                $l isa identity-link, links (linked-person: $p), has merge-flag true;
-            select $l;"#
-        );
-        let has_merge = !self.collect_rows(&merge_q).await?.is_empty();
-
-        let merge_q2 = format!(
-            r#"match
-                $p isa person, has entity-id "{b}";
-                $l isa identity-link, links (linked-person: $p), has merge-flag true;
-            select $l;"#
-        );
-        let has_merge = has_merge || !self.collect_rows(&merge_q2).await?.is_empty();
+        let has_merge = !self
+            .collect_named_rows_given(IDENTITY_MERGE_Q, rows_eid(person_a.0))
+            .await?
+            .is_empty();
+        let has_merge = has_merge
+            || !self
+                .collect_named_rows_given(IDENTITY_MERGE_Q, rows_eid(person_b.0))
+                .await?
+                .is_empty();
 
         if has_merge || (!canon_a.is_empty() && canon_a == canon_b) {
             Ok(IdentityAction::Merge)
@@ -775,35 +744,10 @@ impl<'a> TypeDbReads<'a> {
         valid_at: Timestamp,
         known_at: Timestamp,
     ) -> Result<bool> {
-        let valid = Self::dt(valid_at);
-        let known = Self::dt(known_at);
-        let eid = entity.0;
-
-        let query = format!(
-            r#"match
-                $p isa person, has entity-id "{eid}";
-                $s isa sanction-listing, links (sanctioned-person: $p);
-                {bt}
-                $s has listed-flag true;
-            select $vf, $vt, $kf, $kt;"#,
-            bt = Self::bitemporal_start("$s", &valid, &known, ""),
-        );
-
-        Ok(self
-            .collect_named_rows(&query)
+        Ok(!self
+            .collect_named_rows_given(&IS_SANCTIONED_Q, rows_evk(entity, valid_at, known_at))
             .await?
-            .into_iter()
-            .any(|row| {
-                Self::row_is_active(
-                    row.get("vf").map(String::as_str).unwrap_or(""),
-                    row.get("vt").map(String::as_str).unwrap_or(""),
-                    row.get("kf").map(String::as_str).unwrap_or(""),
-                    row.get("kt").map(String::as_str).unwrap_or(""),
-                    None,
-                    &valid,
-                    &known,
-                )
-            }))
+            .is_empty())
     }
 
     /// Q9 — role-agnostic traversal.
@@ -817,43 +761,15 @@ impl<'a> TypeDbReads<'a> {
         valid_at: Timestamp,
         known_at: Timestamp,
     ) -> Result<Neighborhood> {
-        let valid = Self::dt(valid_at);
-        let known = Self::dt(known_at);
-        let bt = Self::bitemporal_start("$r", &valid, &known, "");
-
-        // Participations that have at least one counterparty.
-        let paired = format!(
-            r#"match
-                $x has entity-id "{eid}";
-                $r links ($role: $x);
-                $r links ($orole: $y);
-                not {{ $y is $x; }};
-                $y has entity-id $yid;
-                $r isa $rt;
-                {bt}
-            select $rt, $role, $yid, $vt, $kt;"#,
-            eid = entity.0
-        );
-
-        // All participations, including relations where the entity is the only player.
-        let solo = format!(
-            r#"match
-                $x has entity-id "{eid}";
-                $r links ($role: $x);
-                $r isa $rt;
-                {bt}
-            select $rt, $role, $vt, $kt;"#,
-            eid = entity.0
-        );
-
         let mut edges = Vec::new();
         let mut paired_kinds: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
 
-        for row in self.collect_named_rows(&paired).await? {
-            if !Self::row_visible(&row, &valid, &known) {
-                continue;
-            }
+        // Participations that have at least one counterparty.
+        for row in self
+            .collect_named_rows_given(&NEIGHBORHOOD_PAIRED_Q, rows_evk(entity, valid_at, known_at))
+            .await?
+        {
             let (rt, role) = (Self::col(&row, "rt"), Self::col(&row, "role"));
             let Some(counterparty) = Self::parse_uuid(&Self::col(&row, "yid")) else {
                 continue;
@@ -866,10 +782,11 @@ impl<'a> TypeDbReads<'a> {
             });
         }
 
-        for row in self.collect_named_rows(&solo).await? {
-            if !Self::row_visible(&row, &valid, &known) {
-                continue;
-            }
+        // All participations, including relations where the entity is the only player.
+        for row in self
+            .collect_named_rows_given(&NEIGHBORHOOD_SOLO_Q, rows_evk(entity, valid_at, known_at))
+            .await?
+        {
             let (rt, role) = (Self::col(&row, "rt"), Self::col(&row, "role"));
             if paired_kinds.contains(&(rt.clone(), role.clone())) {
                 continue;
@@ -886,11 +803,6 @@ impl<'a> TypeDbReads<'a> {
 
     fn col(row: &HashMap<String, String>, key: &str) -> String {
         row.get(key).cloned().unwrap_or_default()
-    }
-
-    fn row_visible(row: &HashMap<String, String>, valid: &str, known: &str) -> bool {
-        Self::interval_open(Some(Self::col(row, "vt").as_str()).filter(|s| !s.is_empty()), valid)
-            && Self::interval_open(Some(Self::col(row, "kt").as_str()).filter(|s| !s.is_empty()), known)
     }
 
     /// Role labels come back qualified (`ownership:owner`); the benchmark compares bare
@@ -918,6 +830,27 @@ impl<'a> TypeDbReads<'a> {
         rows
     }
 
+    /// Runs a constant query text with parameters supplied as `given` rows, so the
+    /// server's parse/translation/compile caches hit on every call.
+    pub(crate) async fn collect_named_rows_given(
+        &self,
+        query: &str,
+        rows: GivenRows,
+    ) -> Result<Vec<HashMap<String, String>>> {
+        let tx = self
+            .driver
+            .transaction(self.database, TransactionType::Read)
+            .await
+            .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+        let answer = tx
+            .query_with_rows(query, rows)
+            .await
+            .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+        let named = Self::extract_named_rows(answer).await;
+        drop(tx);
+        named
+    }
+
     async fn extract_named_rows(answer: QueryAnswer) -> Result<Vec<HashMap<String, String>>> {
         if !answer.is_row_stream() {
             return Ok(vec![]);
@@ -939,85 +872,6 @@ impl<'a> TypeDbReads<'a> {
         Ok(out)
     }
 
-    async fn collect_string_column(&self, query: &str, column: &str) -> Result<Vec<String>> {
-        let rows = self.collect_rows(query).await?;
-        if rows.is_empty() {
-            return Ok(vec![]);
-        }
-        // Single-column select
-        if rows[0].1.is_empty() {
-            return Ok(rows.into_iter().map(|r| r.0).collect());
-        }
-        // Named column - re-run parsing from full row map
-        let tx = self
-            .driver
-            .transaction(self.database, TransactionType::Read)
-            .await
-            .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
-        let answer = tx
-            .query(query)
-            .await
-            .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
-        let out = Self::extract_column(answer, column).await;
-        drop(tx);
-        out
-    }
-
-    async fn collect_rows(&self, query: &str) -> Result<Vec<(String, String)>> {
-        let tx = self
-            .driver
-            .transaction(self.database, TransactionType::Read)
-            .await
-            .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
-        let answer = tx
-            .query(query)
-            .await
-            .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
-        let rows = Self::extract_rows(answer).await;
-        drop(tx);
-        rows
-    }
-
-    async fn extract_rows(answer: QueryAnswer) -> Result<Vec<(String, String)>> {
-        if !answer.is_row_stream() {
-            return Ok(vec![]);
-        }
-        let mut stream = answer.into_rows();
-        let mut out = Vec::new();
-        while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
-            let cols = row.get_column_names();
-            let mut values = Vec::new();
-            for col in cols {
-                if let Ok(Some(concept)) = row.get(col) {
-                    values.push(concept_string(concept));
-                }
-            }
-            match values.len() {
-                0 => {}
-                1 => out.push((values[0].clone(), String::new())),
-                _ => out.push((values[0].clone(), values[1].clone())),
-            }
-        }
-        Ok(out)
-    }
-
-    async fn extract_column(answer: QueryAnswer, column: &str) -> Result<Vec<String>> {
-        if !answer.is_row_stream() {
-            return Ok(vec![]);
-        }
-        let mut stream = answer.into_rows();
-        let mut out = Vec::new();
-        while let Some(row) = stream.next().await {
-            let row = row.map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
-            if let Ok(Some(concept)) = row.get(column) {
-                out.push(concept_string(concept));
-            } else if let Ok(Some(concept)) = row.get_index(0) {
-                out.push(concept_string(concept));
-            }
-        }
-        Ok(out)
-    }
 }
 
 fn concept_string(concept: &Concept) -> String {
