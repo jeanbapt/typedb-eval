@@ -263,6 +263,81 @@ At M, PostgreSQL is ~2.9× faster on avg p50; neither backend shows false allow/
 
 ---
 
+## Where TypeDB shines (and what that means for SGRS)
+
+This benchmark’s verdict is **KEEP POSTGRES** for the operational store at scale M. That does not mean TypeDB failed — it means the measured wins did not clear the adoption bar (≥3× performance or complexity, or invariants SQL cannot enforce). TypeDB still has a clear **shine profile** worth separating from the headline verdict.
+
+### What actually shines in measurement
+
+| Signal | TypeDB | PostgreSQL | Why it matters |
+|--------|--------|------------|----------------|
+| **Pass rate (M)** | **98.2%** | 86.4% | Oracle alignment on hard semantic queries, not safety (both: 0 false allow/block) |
+| **Pass rate (S)** | **98.6%** | 94.7% | Same pattern at smaller scale |
+| **Q7 / Q8** | Near-oracle | Mostly `incorrect_historical_replay` at M | Bitemporal **decision replay** and **retrospective classification** |
+| **Semantic churn** | **1.00** | 1.17 | Fewer physical mutations per semantic change |
+| **Schema evolution (Q9)** | 100% recall, 0 repair LOC | 100% recall, 0 repair LOC (after participation index) | Parity after Postgres fix — no longer a TypeDB-only win |
+
+The concentrated gap is **historical semantics**: “what would we have decided then?” (Q7) and “how should we classify that past situation now?” (Q8). TypeDB’s optimized backend keeps those aligned with the oracle; Postgres in this repo still drifts on replay at M.
+
+### What shines in the model (even where Postgres tied)
+
+These are the PERA properties that originally motivated the trial — several still read cleaner in TypeQL than in SQL, even when recall is equal:
+
+1. **Polymorphic roles** — `trust` plays `control-via-nominee:controller` with a one-line schema extension; no discriminator column or FK exception table.
+2. **N-ary relations** — `control-via-nominee` (controller, controlled, nominee, instrument) is a native relation type, not a join of binary tables.
+3. **Role-agnostic traversal** — frozen Q9 as `$r links ($role: $x)` instead of maintaining a participation index on every ingest path (Postgres now matches recall via `entity_participation`, but the index is application glue).
+4. **Server-side recursion** — transitive ownership in `schema.tql` functions with bitemporal `given` parameters, shared across Q1/Q5/Q7/Q8/Q9 instead of duplicated recursive CTE strings.
+5. **Typed invariants** — which entity types may play which roles in which relation is schema-enforced, not convention in Rust.
+
+TypeDB does **not** shine here on **latency** (~2.9× slower avg p50 at M, ~6× at S), **operational maturity**, or **agent MCP ergonomics** (both backends are equally awkward for NL retrieval until the agent learns the schema).
+
+### Implications for SGRS and an open swarm of governed agents
+
+SGRS targets a **lattice algebra over governed semantic state**: evidence, context compatibility, bitemporal visibility, and provenance are not optional metadata — they define what “true” means for a query. An **open swarm** of governed agents adds another requirement: each agent must be able to **act and be audited** against a **shared ontology** that **extends over time**, without silent under-reporting when the ontology grows.
+
+Mapping benchmark lessons to that architecture:
+
+| SGRS / swarm need | Benchmark proxy | Practical takeaway |
+|-------------------|-----------------|-------------------|
+| **Auditable replay** — “what decision would agent A have made on date D?” | Q7, Q8 | Treat historical replay as a **first-class test suite**, not an afterthought. TypeDB’s edge here is a warning: Postgres can store bitemporal data but still **mis-implement** replay logic. |
+| **Ontology growth** — new party kinds, control patterns, jurisdictions | Q9 schema evolution | **100% recall on a frozen query** is achievable on both backends; Postgres needs explicit indexes/views maintained on ingest; TypeDB needs disciplined TypeQL patterns. Neither removes schema work — they change **where** repair happens. |
+| **No silent safety bugs** | false allow/block = 0 | Both backends are safe on ALLOW/BLOCK in this domain; remaining failures are **classification drift**, not catastrophic policy bypass. |
+| **Agent retrieval via MCP** | agent-retrieval benchmark | Persistence choice matters less than **schema discoverability** and **stable query templates** agents can reuse. |
+| **Semantic churn** | churn ratio | Prefer stores and ingest paths that close knowledge intervals instead of rewriting rows when semantics change. |
+
+**Default for SGRS today (from this benchmark):** **PostgreSQL as the operational store**, with patterns borrowed from the TypeDB side:
+
+- **Participation / neighborhood index** (or equivalent) so role-agnostic traversal does not require `UNION` repair on every ontology extension.
+- **Oracle-backed conformance tests** for Q7/Q8-style replay on every backend change — the lattice lives in `crates/core`; the store must not reinterpret it incorrectly.
+- **Schema functions as a design pattern** — even in SQL, centralize recursive ownership and bitemporal filters once (views, SQL functions) instead of per-query CTE copies.
+
+**When TypeDB would deserve reconsideration:**
+
+- Postgres **cannot close the Q7/Q8 gap** without unacceptable query complexity or ongoing replay bugs at production scale.
+- Ontology extension frequency makes **query-surface repair** dominate engineering (Q9 recall drops below 100% in production despite participation indexes).
+- **Scale L** or production traces show TypeDB ≥3× faster on the queries that matter after further engine/backend work (this benchmark did not run L; M showed no such signal).
+- **TypeGraph** (or future TypeDB temporal APIs) offers **native recorded-time / bitemporal reads** without the four-attribute emulation used here — worth a separate eval, not assumed from TypeDB CE.
+
+**Hybrid shapes (if replay correctness keeps diverging):**
+
+1. **Postgres primary + TypeDB read model** — ingest to Postgres; project graph-shaped slices to TypeDB for traversal-heavy audit queries (higher ops cost, replay isolated to projection jobs).
+2. **Postgres storage + core oracle in Rust** — all ALLOW/BLOCK/REVIEW flow through `crates/core` lattice code; DB is a **projection**, not the source of semantic truth (closest to full SGRS architecture; this benchmark already treats the oracle as ground truth).
+3. **Agent layer only** — swarm agents never write raw SQL/TypeQL; they call **governed MCP tools** with fixed query families (Q1–Q9 templates). Reduces ontology-extension pain for agents; does not remove backend repair for new relation types.
+
+**Concrete improvements before choosing TypeDB:**
+
+| Area | Postgres path | TypeDB path |
+|------|---------------|-------------|
+| Q7/Q8 at M | Debug historical-replay vs oracle; align recursive + bitemporal CTEs with `visible_at` | Already strong; keep regression suite |
+| Q9 | Keep `entity_participation` in sync on all ingest paths | Keep `bitemporal_active` + role-agnostic patterns in schema functions |
+| Agents | Publish MCP tool catalog mapped to Q1–Q9; few-shot examples per query family | Same — TypeQL is not easier for agents without templates |
+| Performance | GiST on both ranges; batch ingest; prepared statements | Further server-side pushdown; reduce round-trips per query |
+| Future stalks / restrictions (Q10–Q12) | Evaluate cross-context restrictions in SQL vs TypeQL before second store | Same eval — see out-of-scope note above |
+
+In short: TypeDB’s shine is **semantic fidelity on hard graph + time queries** and **ontology-native modeling**; SGRS’s default path is still **Postgres + core lattice + conformance tests**, importing TypeDB’s **patterns** (participation index, centralized recursion, replay tests) without importing TypeDB as the sole store unless replay or extension cost forces a reopen.
+
+---
+
 ## Bitemporality: what we learned
 
 This benchmark does **not** show that TypeDB is bad at managing time. Early failures (~59% TypeDB pass rate) came mainly from **implementation bugs** in the Rust/TypeQL backend, not an engine limitation:
