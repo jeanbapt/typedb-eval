@@ -237,20 +237,29 @@ For Cursor, copy [`.cursor/mcp.json.example`](.cursor/mcp.json.example) to `.cur
 
 ---
 
-## Latest results (scale S, seed 42)
+## Latest results (seed 42)
 
-Warm run after TypeDB backend optimizations (server-side recursion, bitemporal pushdown, given-parameterized queries) and a benchmark rerun on TypeDB 3.12.2.
+After TypeDB backend optimizations (server-side recursion, bitemporal pushdown, given-parameterized queries) and a Postgres Q9 fix (`entity_participation` index — frozen traversal survives ontology extension without query repair). TypeDB CE 3.12.2.
+
+### Scale S (~1k events, warm)
 
 | Backend | Pass rate | Ingest | Churn | Avg p50 | Missed relations | False allow/block |
 |---------|-----------|--------|-------|---------|------------------|-------------------|
 | **PostgreSQL** | 94.7% | 0.4 s | 1.16 | 1.1 ms | 0 | 0 |
 | **TypeDB** | **98.6%** | 2.6 s | 1.01 | 6.5 ms | 0 | 0 |
 
-**Q7/Q8 (bitemporal replay / retrospective view)**: 100% pass rate on TypeDB.
+### Scale M (~20k events, cold)
 
-**Schema evolution (Q9)**: TypeDB keeps 100% recall with a frozen query; PostgreSQL drops to 56.7% and needs 20 LOC of repair ([`results/SCHEMA_EVOLUTION.md`](results/SCHEMA_EVOLUTION.md)).
+| Backend | Pass rate | Ingest | Churn | Avg p50 | Missed relations | False allow/block |
+|---------|-----------|--------|-------|---------|------------------|-------------------|
+| **PostgreSQL** | 86.4% | 24.3 s | 1.17 | 46 ms | 0 | 0 |
+| **TypeDB** | **98.2%** | 68.4 s | 1.00 | 133 ms | 0 | 0 |
 
-Current verdict: **[INVESTIGATE HYBRID](results/DECISION.md)** — TypeDB wins on ontology evolution; PostgreSQL is ~6× faster on avg p50 at this scale.
+At M, PostgreSQL is ~2.9× faster on avg p50; neither backend shows false allow/block. Remaining gaps are mostly Q7/Q8 historical-replay mismatches vs the oracle, not safety violations.
+
+**Schema evolution (Q9, scale S)**: both backends keep **100%** recall with a frozen query and **0** repair LOC ([`results/SCHEMA_EVOLUTION.md`](results/SCHEMA_EVOLUTION.md)). Postgres uses a participation index written on ingest; TypeDB uses role-agnostic `$r links ($role: $x)` patterns.
+
+**Verdict at M**: **[KEEP POSTGRES](results/DECISION.md)** — no structural TypeDB win on performance or schema evolution at this scale; TypeDB retains a correctness edge on pass rate. Scale S alone suggested INVESTIGATE HYBRID before the Postgres Q9 fix and the M run.
 
 ---
 
@@ -270,7 +279,7 @@ This benchmark does **not** show that TypeDB is bad at managing time. Early fail
 
 1. **Ergonomics** — even with schema functions and server-side filters, combining recursion, polymorphism, and bitemporal constraints in TypeQL is more verbose than a Postgres recursive CTE with `tstzrange @> timestamptz`.
 2. **Pushdown** — Postgres filters intervals via GiST in SQL; the TypeDB backend now pushes bitemporal bounds into TypeQL, but interval indexing semantics still differ from native `tstzrange`.
-3. **Performance** — ~6× slower avg p50 on scale S after backend optimizations (down from ~73× before server-side recursion and query parameterization).
+3. **Performance** — ~6× slower avg p50 on scale S (~2.9× on scale M) after backend optimizations (down from ~73× on S before server-side recursion and query parameterization).
 
 In short: TypeDB's **model** supports the bitemporality SGRS requires (Q7/Q8 pass). The **cost** is mostly latency and query ergonomics, not broken temporal semantics.
 
