@@ -15,8 +15,6 @@ use benchmark_core::{
 
 use crate::reads::TypeDbReads;
 
-/// Builds a single-row `GivenRows` from (variable, entry) pairs, so every write
-/// query keeps a constant text and passes its parameters out of band.
 fn given_row(entries: Vec<(&str, GivenRowEntry)>) -> GivenRows {
     let (names, values): (Vec<String>, Vec<GivenRowEntry>) = entries
         .into_iter()
@@ -316,7 +314,6 @@ impl TypeDbStore {
         }
     }
 
-    /// Commits a constant-text write query with its parameters passed as `given` rows.
     async fn run_write_given(&self, query: &str, rows: GivenRows) -> Result<()> {
         let tx = self
             .driver
@@ -358,7 +355,7 @@ impl TypeDbStore {
 
         if let Ok(rows) = self
             .reads()
-            .collect_named_rows_given(FETCH_OWNERSHIP_Q, id_row())
+            .collect_rows_given(FETCH_OWNERSHIP_Q, id_row())
             .await
         {
             if let Some(row) = rows.first() {
@@ -417,7 +414,7 @@ impl TypeDbStore {
 
         if let Ok(rows) = self
             .reads()
-            .collect_named_rows_given(FETCH_GENERIC_Q, id_row())
+            .collect_rows_given(FETCH_GENERIC_Q, id_row())
             .await
         {
             if let Some(row) = rows.first() {

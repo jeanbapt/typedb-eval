@@ -169,10 +169,7 @@ fun active-person-owners($owned: company, $valid: datetime, $known: datetime) ->
         not { $o has known-to $kt; $kt <= $known; };
     return { $p };
 
-# Companies transitively owning $target through active edges. Left-recursive per
-# the TypeQL optimization guide: the recursive call always receives the original
-# arguments, so tabled execution builds a single table per (target, valid, known)
-# instead of one per intermediate company.
+# Companies transitively owning $target through active edges (left-recursive).
 fun transitive-owner-companies($target: company, $valid: datetime, $known: datetime) -> { company }:
     match
         {

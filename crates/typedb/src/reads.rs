@@ -252,11 +252,9 @@ static NEIGHBORHOOD_PAIRED_Q: LazyLock<String> = LazyLock::new(|| {
         r#"{GIVEN_EVK}
         match
             $x has entity-id == $eid;
-            $r links ($role: $x);
-            $r links ($orole: $y);
+            $r isa! $rt, links ($role: $x, $orole: $y);
             not {{ $y is $x; }};
             $y has entity-id $yid;
-            $r isa $rt;
             try {{ $r has predicate-name $pred; }};
             {bt}
         select $rt, $role, $yid, $pred;"#,
@@ -269,8 +267,7 @@ static NEIGHBORHOOD_SOLO_Q: LazyLock<String> = LazyLock::new(|| {
         r#"{GIVEN_EVK}
         match
             $x has entity-id == $eid;
-            $r links ($role: $x);
-            $r isa $rt;
+            $r isa! $rt, links ($role: $x);
             try {{ $r has predicate-name $pred; }};
             {bt}
         select $rt, $role, $pred;"#,
@@ -326,7 +323,7 @@ impl<'a> TypeDbReads<'a> {
         let mut out = Vec::new();
 
         for row in self
-            .collect_named_rows_given(&OWNERSHIP_OWNED_Q, rows_evk(entity, valid_at, known_at))
+            .collect_rows_given(&OWNERSHIP_OWNED_Q, rows_evk(entity, valid_at, known_at))
             .await?
         {
             if row.get("sid").and_then(|s| Uuid::parse_str(s).ok()).is_none() {
@@ -356,7 +353,7 @@ impl<'a> TypeDbReads<'a> {
         }
 
         for row in self
-            .collect_named_rows_given(&OWNERSHIP_OWNER_Q, rows_evk(entity, valid_at, known_at))
+            .collect_rows_given(&OWNERSHIP_OWNER_Q, rows_evk(entity, valid_at, known_at))
             .await?
         {
             let Some(object) = row
@@ -390,7 +387,7 @@ impl<'a> TypeDbReads<'a> {
         }
 
         for row in self
-            .collect_named_rows_given(&GENERIC_SUBJECT_Q, rows_evk(entity, valid_at, known_at))
+            .collect_rows_given(&GENERIC_SUBJECT_Q, rows_evk(entity, valid_at, known_at))
             .await?
         {
             let Some(object) = row
@@ -420,7 +417,7 @@ impl<'a> TypeDbReads<'a> {
         }
 
         for row in self
-            .collect_named_rows_given(&GENERIC_OBJECT_Q, rows_evk(entity, valid_at, known_at))
+            .collect_rows_given(&GENERIC_OBJECT_Q, rows_evk(entity, valid_at, known_at))
             .await?
         {
             if row.get("sid").and_then(|s| Uuid::parse_str(s).ok()).is_none() {
@@ -538,8 +535,6 @@ impl<'a> TypeDbReads<'a> {
         conflicts
     }
 
-    /// Beneficial owners via the schema-level left-recursive TypeQL function:
-    /// recursion and bitemporal edge filtering both run inside the server.
     pub async fn beneficial_owners(
         &self,
         entity: EntityId,
@@ -547,7 +542,7 @@ impl<'a> TypeDbReads<'a> {
         known_at: Timestamp,
     ) -> Result<Vec<PersonId>> {
         let mut owners: Vec<PersonId> = self
-            .collect_named_rows_given(&BENEFICIAL_OWNERS_Q, rows_evk(entity, valid_at, known_at))
+            .collect_rows_given(&BENEFICIAL_OWNERS_Q, rows_evk(entity, valid_at, known_at))
             .await?
             .into_iter()
             .filter_map(|row| {
@@ -585,10 +580,6 @@ impl<'a> TypeDbReads<'a> {
         Ok(Self::oracle_contradictions(&assertions))
     }
 
-    /// Exposure via the schema-level functions: direct owners, co-owners of every
-    /// company the entity transitively owns, and sanctioned persons on that path all
-    /// come back from three queries whose recursion and bitemporal filtering run
-    /// inside the server.
     pub async fn ownership_exposure(
         &self,
         entity: EntityId,
@@ -596,23 +587,16 @@ impl<'a> TypeDbReads<'a> {
         known_at: Timestamp,
     ) -> Result<Exposure> {
         let direct_owners: Vec<EntityId> = self
-            .collect_named_rows_given(&EXPO_DIRECT_Q, rows_evk(entity, valid_at, known_at))
+            .collect_rows_given(&EXPO_DIRECT_Q, rows_evk(entity, valid_at, known_at))
             .await?
             .into_iter()
             .filter_map(|row| Some(EntityId(Uuid::parse_str(row.get("did")?).ok()?)))
             .collect();
 
-        // Companies the entity transitively owns, and their other direct owners.
-        // Mirrors the oracle: for every company reachable downward from the entity,
-        // each of its active owners joins the exposure path. Walking down from the
-        // fixed root keeps tabled recursion to a single table per probe. The root
-        // binding must stay linear (outside any disjunction): the planner rejects a
-        // variable bound by `isa` inside a branch being passed to a function in that
-        // same branch, so company and person roots are two queries.
         let mut co_owners: Vec<EntityId> = Vec::new();
         for query in [&*EXPO_SUBS_COMPANY_Q, &*EXPO_SUBS_PERSON_Q] {
             co_owners.extend(
-                self.collect_named_rows_given(query, rows_evk(entity, valid_at, known_at))
+                self.collect_rows_given(query, rows_evk(entity, valid_at, known_at))
                     .await?
                     .into_iter()
                     .filter_map(|row| Some(EntityId(Uuid::parse_str(row.get("coid")?).ok()?))),
@@ -631,7 +615,7 @@ impl<'a> TypeDbReads<'a> {
         let mut sanctioned: Vec<Uuid> = Vec::new();
         for query in [&*EXPO_SANCTIONED_COMPANY_Q, &*EXPO_SANCTIONED_PERSON_Q] {
             sanctioned.extend(
-                self.collect_named_rows_given(query, rows_evk(entity, valid_at, known_at))
+                self.collect_rows_given(query, rows_evk(entity, valid_at, known_at))
                     .await?
                     .into_iter()
                     .filter_map(|row| Uuid::parse_str(row.get("pid")?).ok()),
@@ -684,7 +668,7 @@ impl<'a> TypeDbReads<'a> {
         let query =
             r#"match $r isa compliance-rule, has rule-id "rule_00", has threshold-pct $t; select $t;"#;
         Ok(self
-            .collect_named_rows(query)
+            .collect_rows(query)
             .await?
             .into_iter()
             .find_map(|row| row.get("t").and_then(|s| s.parse().ok()))
@@ -706,7 +690,7 @@ impl<'a> TypeDbReads<'a> {
             ])
             .expect("given row width");
         let rows = self
-            .collect_named_rows_given(IDENTITY_NAMES_Q, name_rows)
+            .collect_rows_given(IDENTITY_NAMES_Q, name_rows)
             .await?;
         let (canon_a, canon_b) = rows
             .first()
@@ -714,12 +698,12 @@ impl<'a> TypeDbReads<'a> {
             .unwrap_or_default();
 
         let has_merge = !self
-            .collect_named_rows_given(IDENTITY_MERGE_Q, rows_eid(person_a.0))
+            .collect_rows_given(IDENTITY_MERGE_Q, rows_eid(person_a.0))
             .await?
             .is_empty();
         let has_merge = has_merge
             || !self
-                .collect_named_rows_given(IDENTITY_MERGE_Q, rows_eid(person_b.0))
+                .collect_rows_given(IDENTITY_MERGE_Q, rows_eid(person_b.0))
                 .await?
                 .is_empty();
 
@@ -747,7 +731,7 @@ impl<'a> TypeDbReads<'a> {
         known_at: Timestamp,
     ) -> Result<bool> {
         Ok(!self
-            .collect_named_rows_given(&IS_SANCTIONED_Q, rows_evk(entity, valid_at, known_at))
+            .collect_rows_given(&IS_SANCTIONED_Q, rows_evk(entity, valid_at, known_at))
             .await?
             .is_empty())
     }
@@ -769,7 +753,7 @@ impl<'a> TypeDbReads<'a> {
 
         // Participations that have at least one counterparty.
         for row in self
-            .collect_named_rows_given(&NEIGHBORHOOD_PAIRED_Q, rows_evk(entity, valid_at, known_at))
+            .collect_rows_given(&NEIGHBORHOOD_PAIRED_Q, rows_evk(entity, valid_at, known_at))
             .await?
         {
             let (rt, role) = Self::oracle_edge_kind(
@@ -790,7 +774,7 @@ impl<'a> TypeDbReads<'a> {
 
         // All participations, including relations where the entity is the only player.
         for row in self
-            .collect_named_rows_given(&NEIGHBORHOOD_SOLO_Q, rows_evk(entity, valid_at, known_at))
+            .collect_rows_given(&NEIGHBORHOOD_SOLO_Q, rows_evk(entity, valid_at, known_at))
             .await?
         {
             let (rt, role) = Self::oracle_edge_kind(
@@ -848,7 +832,7 @@ impl<'a> TypeDbReads<'a> {
         Uuid::parse_str(s.trim().trim_matches('"')).ok()
     }
 
-    pub(crate) async fn collect_named_rows(&self, query: &str) -> Result<Vec<HashMap<String, String>>> {
+    pub(crate) async fn collect_rows(&self, query: &str) -> Result<Vec<HashMap<String, String>>> {
         let tx = self
             .driver
             .transaction(self.database, TransactionType::Read)
@@ -858,14 +842,12 @@ impl<'a> TypeDbReads<'a> {
             .query(query)
             .await
             .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
-        let rows = Self::extract_named_rows(answer).await;
+        let rows = Self::extract_rows(answer).await;
         drop(tx);
         rows
     }
 
-    /// Runs a constant query text with parameters supplied as `given` rows, so the
-    /// server's parse/translation/compile caches hit on every call.
-    pub(crate) async fn collect_named_rows_given(
+    pub(crate) async fn collect_rows_given(
         &self,
         query: &str,
         rows: GivenRows,
@@ -879,12 +861,12 @@ impl<'a> TypeDbReads<'a> {
             .query_with_rows(query, rows)
             .await
             .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
-        let named = Self::extract_named_rows(answer).await;
+        let named = Self::extract_rows(answer).await;
         drop(tx);
         named
     }
 
-    async fn extract_named_rows(answer: QueryAnswer) -> Result<Vec<HashMap<String, String>>> {
+    async fn extract_rows(answer: QueryAnswer) -> Result<Vec<HashMap<String, String>>> {
         if !answer.is_row_stream() {
             return Ok(vec![]);
         }
@@ -893,12 +875,12 @@ impl<'a> TypeDbReads<'a> {
         while let Some(row) = stream.next().await {
             let row = row.map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
             let mut map = HashMap::new();
-            for col in row.get_column_names() {
-                if let Ok(Some(concept)) = row.get(col) {
-                    map.insert(col.to_string(), concept_string(concept));
-                } else {
-                    map.insert(col.to_string(), String::new());
-                }
+            for (i, col) in row.get_column_names().iter().enumerate() {
+                let value = match row.get_index(i) {
+                    Ok(Some(concept)) => concept_string(concept),
+                    _ => String::new(),
+                };
+                map.insert(col.clone(), value);
             }
             out.push(map);
         }
