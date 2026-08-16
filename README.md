@@ -100,7 +100,7 @@ Both backends implement the same `ComplianceStore` interface. Business logic is 
 ## Quick start
 
 ```bash
-# Start PostgreSQL 16 and TypeDB 3.12
+# Start PostgreSQL 16 and TypeDB 3.12.2
 docker compose up -d
 
 # Wait for services to be ready, then:
@@ -237,20 +237,20 @@ For Cursor, copy [`.cursor/mcp.json.example`](.cursor/mcp.json.example) to `.cur
 
 ---
 
-## Latest results (scale S, seed 42, cold)
+## Latest results (scale S, seed 42)
 
-Last run after correctness fixes (deterministic assertion IDs, knowledge closure, Q9 traversal, TypeDB oracle alignment).
+Warm run after TypeDB backend optimizations (server-side recursion, bitemporal pushdown, given-parameterized queries) and a benchmark rerun on TypeDB 3.12.2.
 
 | Backend | Pass rate | Ingest | Churn | Avg p50 | Missed relations | False allow/block |
 |---------|-----------|--------|-------|---------|------------------|-------------------|
-| **PostgreSQL** | 94.7% | 2.3 s | 1.16 | 4.0 ms | 0 | 0 |
-| **TypeDB** | **98.3%** | 6.4 s | 1.01 | 295 ms | 2 | 0 |
+| **PostgreSQL** | 94.7% | 0.4 s | 1.16 | 1.1 ms | 0 | 0 |
+| **TypeDB** | **98.6%** | 2.6 s | 1.01 | 6.5 ms | 0 | 0 |
 
-**Q7/Q8 (bitemporal replay / retrospective view)**: 100% pass rate on TypeDB after aligning the query layer with the oracle (ownership chains, exposure, contradictions, context compatibility).
+**Q7/Q8 (bitemporal replay / retrospective view)**: 100% pass rate on TypeDB.
 
-**Schema evolution (Q9)**: TypeDB keeps 100% recall with a frozen query; PostgreSQL drops to 28.7% and needs ~20 LOC of repair ([`results/SCHEMA_EVOLUTION.md`](results/SCHEMA_EVOLUTION.md)).
+**Schema evolution (Q9)**: TypeDB keeps 100% recall with a frozen query; PostgreSQL drops to 56.7% and needs 20 LOC of repair ([`results/SCHEMA_EVOLUTION.md`](results/SCHEMA_EVOLUTION.md)).
 
-Current verdict: **[INVESTIGATE HYBRID](results/DECISION.md)** — TypeDB wins on ontology evolution; PostgreSQL wins decisively on latency.
+Current verdict: **[INVESTIGATE HYBRID](results/DECISION.md)** — TypeDB wins on ontology evolution; PostgreSQL is ~6× faster on avg p50 at this scale.
 
 ---
 
@@ -268,11 +268,11 @@ This benchmark does **not** show that TypeDB is bad at managing time. Early fail
 
 **Where TypeDB is still weaker in this evaluation**:
 
-1. **Ergonomics** — combining recursion (ownership), polymorphism, and bitemporal filters in TypeQL needs more glue code than a Postgres recursive CTE with `tstzrange @> timestamptz`.
-2. **Pushdown** — Postgres filters intervals via GiST in SQL; our TypeDB backend often fetches relations and filters in Rust (`row_is_active`).
-3. **Performance** — ~73× slower p50 on scale S, partly due to fetch-and-filter.
+1. **Ergonomics** — even with schema functions and server-side filters, combining recursion, polymorphism, and bitemporal constraints in TypeQL is more verbose than a Postgres recursive CTE with `tstzrange @> timestamptz`.
+2. **Pushdown** — Postgres filters intervals via GiST in SQL; the TypeDB backend now pushes bitemporal bounds into TypeQL, but interval indexing semantics still differ from native `tstzrange`.
+3. **Performance** — ~6× slower avg p50 on scale S after backend optimizations (down from ~73× before server-side recursion and query parameterization).
 
-In short: TypeDB's **model** supports the bitemporality SGRS requires (Q7/Q8 pass). The **cost** is query complexity and latency, not broken temporal semantics.
+In short: TypeDB's **model** supports the bitemporality SGRS requires (Q7/Q8 pass). The **cost** is mostly latency and query ergonomics, not broken temporal semantics.
 
 ---
 
@@ -287,6 +287,13 @@ See [results/DECISION.md](results/DECISION.md) after running the benchmark. The 
 5. Where TypeDB wins / where PostgreSQL wins
 6. Architectural cost of TypeDB
 7. Explicit verdict
+
+---
+
+## Contributors
+
+- **Deal ex Machina SAS** — benchmark design, PostgreSQL backend, oracle, fixtures, runner
+- **[Joshua Send](https://github.com/flyingsilverfin)** ([TypeDB](https://typedb.com/)) — TypeDB backend optimizations: server-side recursion via schema functions, bitemporal filtering in TypeQL, `given`-parameterized queries (driver 3.12.3), Q9 vocabulary alignment with the oracle, and schema-evolution signal fixes
 
 ---
 
