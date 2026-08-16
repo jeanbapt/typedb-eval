@@ -2883,9 +2883,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "typedb-driver"
-version = "3.12.2"
+version = "3.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b7f06d928432422b12098cc0b5e2475de5bc50d36e5c6be005f34dc9588ed06"
+checksum = "76c285253f1b328ea1773acf5a68d64fc3917b1c20066186a2c6a578e3dc3922"
 dependencies = [
  "chrono",
  "chrono-tz",

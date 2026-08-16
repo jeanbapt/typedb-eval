@@ -16,7 +16,7 @@ services:
       retries: 10
 
   typedb:
-    image: typedb/typedb:3.12.1
+    image: typedb/typedb:3.12.2
     ports:
       - "1729:1729"
     volumes:

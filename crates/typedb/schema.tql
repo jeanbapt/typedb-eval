@@ -136,16 +136,97 @@ entity compliance-rule,
     owns rule-id @key,
     owns threshold-pct;
 
-# Recursive transitive owners (left-recursive, tabling-safe per TypeDB docs).
-# Bitemporal filters are applied at the call site in match pipelines.
-fun transitive-owner-persons($target: company) -> { person }:
+# Bitemporal edge visibility, shared by the recursive functions below. An edge is
+# active at (valid, known) when both intervals started at or before the probe
+# instants and no upper bound at or before them exists (absent attribute = open
+# interval), and its evidence is not REFUTED.
+#
+# TypeDB 3.12 rejects `not { ... }` in the body of a *recursive* function
+# (stratification guard, applied syntactically per function), so the negations
+# live in these non-recursive helpers and the recursive function only composes
+# function calls.
+fun active-company-owners($owned: company, $valid: datetime, $known: datetime) -> { company }:
+    match
+        $o isa ownership, links (owner: $c, owned: $owned);
+        $c isa company;
+        $o has valid-from $vf, has known-from $kf, has evidence-state $ev;
+        $vf <= $valid;
+        $kf <= $known;
+        not { $ev == "REFUTED"; };
+        not { $o has valid-to $vt; $vt <= $valid; };
+        not { $o has known-to $kt; $kt <= $known; };
+    return { $c };
+
+fun active-person-owners($owned: company, $valid: datetime, $known: datetime) -> { person }:
+    match
+        $o isa ownership, links (owner: $p, owned: $owned);
+        $p isa person;
+        $o has valid-from $vf, has known-from $kf, has evidence-state $ev;
+        $vf <= $valid;
+        $kf <= $known;
+        not { $ev == "REFUTED"; };
+        not { $o has valid-to $vt; $vt <= $valid; };
+        not { $o has known-to $kt; $kt <= $known; };
+    return { $p };
+
+# Companies transitively owning $target through active edges (left-recursive).
+fun transitive-owner-companies($target: company, $valid: datetime, $known: datetime) -> { company }:
     match
         {
-            $o isa ownership, links (owner: $p, owned: $target);
-            $p isa person;
+            let $c in active-company-owners($target, $valid, $known);
         } or {
-            $o isa ownership, links (owner: $mid, owned: $target);
-            $mid isa company;
-            let $p in transitive-owner-persons($mid);
+            let $via in transitive-owner-companies($target, $valid, $known);
+            let $c in active-company-owners($via, $valid, $known);
+        };
+    return { $c };
+
+# Downward counterparts: companies one active edge below an owner, and the
+# transitive closure from a fixed root. Exposure (Q5/Q7/Q8) walks down from the
+# probe entity, so the left-recursive form keys its single table on the root
+# instead of scanning every company.
+fun active-owned-companies($owner: company, $valid: datetime, $known: datetime) -> { company }:
+    match
+        $o isa ownership, links (owner: $owner, owned: $c);
+        $c isa company;
+        $o has valid-from $vf, has known-from $kf, has evidence-state $ev;
+        $vf <= $valid;
+        $kf <= $known;
+        not { $ev == "REFUTED"; };
+        not { $o has valid-to $vt; $vt <= $valid; };
+        not { $o has known-to $kt; $kt <= $known; };
+    return { $c };
+
+fun active-owned-companies-of-person($owner: person, $valid: datetime, $known: datetime) -> { company }:
+    match
+        $o isa ownership, links (owner: $owner, owned: $c);
+        $c isa company;
+        $o has valid-from $vf, has known-from $kf, has evidence-state $ev;
+        $vf <= $valid;
+        $kf <= $known;
+        not { $ev == "REFUTED"; };
+        not { $o has valid-to $vt; $vt <= $valid; };
+        not { $o has known-to $kt; $kt <= $known; };
+    return { $c };
+
+fun transitive-owned-companies($root: company, $valid: datetime, $known: datetime) -> { company }:
+    match
+        {
+            let $c in active-owned-companies($root, $valid, $known);
+        } or {
+            let $via in transitive-owned-companies($root, $valid, $known);
+            let $c in active-owned-companies($via, $valid, $known);
+        };
+    return { $c };
+
+# Persons one active edge above $target or above any company transitively owning
+# it. Not itself recursive; the recursion (and its single table) lives in
+# transitive-owner-companies.
+fun transitive-owner-persons($target: company, $valid: datetime, $known: datetime) -> { person }:
+    match
+        {
+            let $p in active-person-owners($target, $valid, $known);
+        } or {
+            let $mid in transitive-owner-companies($target, $valid, $known);
+            let $p in active-person-owners($mid, $valid, $known);
         };
     return { $p };
