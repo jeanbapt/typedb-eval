@@ -139,23 +139,29 @@ CREATE INDEX IF NOT EXISTS idx_cvn_controlled ON control_via_nominee (controlled
 CREATE INDEX IF NOT EXISTS idx_cvn_valid ON control_via_nominee USING GIST (valid_range);
 CREATE INDEX IF NOT EXISTS idx_cvn_known ON control_via_nominee USING GIST (known_range);
 
--- Role-agnostic neighborhood VIEW (base ontology). Extension branches are appended in repair.
+-- Role-agnostic participation index: one row per (entity, relation, role) edge.
+-- Written on ingest so Q9 can stay a single frozen query as the ontology grows.
+CREATE TABLE IF NOT EXISTS entity_participation (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    entity_id       UUID NOT NULL,
+    rel             TEXT NOT NULL,
+    role            TEXT NOT NULL,
+    other_id        UUID,
+    valid_range     TSTZRANGE NOT NULL,
+    known_range     TSTZRANGE NOT NULL,
+    source_id       UUID,
+    source_table    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_participation_entity ON entity_participation (entity_id);
+CREATE INDEX IF NOT EXISTS idx_participation_valid ON entity_participation USING GIST (valid_range);
+CREATE INDEX IF NOT EXISTS idx_participation_known ON entity_participation USING GIST (known_range);
+CREATE INDEX IF NOT EXISTS idx_participation_source ON entity_participation (source_table, source_id);
+
+-- Convenience view for introspection; Q9 reads entity_participation directly.
 CREATE OR REPLACE VIEW entity_neighborhood AS
-    SELECT owner_id AS entity_id, 'ownership' AS rel, 'owner' AS role, owned_id AS other_id,
-           valid_range, known_range
-      FROM ownership_assertion
-    UNION ALL
-    SELECT owned_id, 'ownership', 'owned', owner_id, valid_range, known_range
-      FROM ownership_assertion
-    UNION ALL
-    SELECT subject_id, 'generic-assertion', 'subject', object_id, valid_range, known_range
-      FROM assertion
-    UNION ALL
-    SELECT object_id, 'generic-assertion', 'object', subject_id, valid_range, known_range
-      FROM assertion
-    UNION ALL
-    SELECT person_id, 'sanction-listing', 'sanctioned-person', NULL::uuid, valid_range, known_range
-      FROM sanction_listing;
+    SELECT entity_id, rel, role, other_id, valid_range, known_range
+      FROM entity_participation;
 
 CREATE TABLE IF NOT EXISTS churn_log (
     id                  BIGSERIAL PRIMARY KEY,

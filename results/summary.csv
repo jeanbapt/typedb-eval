@@ -1,3 +1,5 @@
 backend,scale,ablation,seed,cold,ingest_ms,churn_ratio,pass_rate,false_allow,false_block,missed_relations,schema_loc,rust_loc,avg_p50_us,avg_p95_us
+postgres,M,none,42,true,24309,1.17,0.8644,0,0,0,151,1440,46033,87814
 postgres,S,none,42,false,430,1.16,0.9472,0,0,0,149,1270,1097,4231
+typedb,M,none,42,true,68391,1.00,0.9822,0,0,0,213,1716,132697,270995
 typedb,S,none,42,false,2612,1.01,0.9861,0,0,0,213,1716,6520,22598

@@ -8,13 +8,13 @@ Scale: S · seed: 42
 
 | Backend | Recall (base) | Recall (extended, frozen query) | Recall (after repair) | Repair LOC |
 |---------|---------------|----------------------------------|------------------------|------------|
-| postgres | 100.0% | 56.7% | 100.0% | 20 |
+| postgres | 100.0% | 100.0% | 100.0% | 0 |
 | typedb | 100.0% | 100.0% | 100.0% | 0 |
 
 ## Relation types visible to the frozen query
 
-**postgres** — expected `control-via-nominee`, `ownership`, saw `ownership`.
-Lost `control-via-nominee` silently: the query returned a smaller answer with no error.
+**postgres** — expected `control-via-nominee`, `ownership`, saw `control-via-nominee`, `ownership`.
+No relation type was lost; the query needed no edit.
 
 **typedb** — expected `control-via-nominee`, `ownership`, saw `control-via-nominee`, `ownership`.
 No relation type was lost; the query needed no edit.
@@ -23,7 +23,7 @@ No relation type was lost; the query needed no edit.
 
 | Backend | Base | Extended (frozen) | Extended (repaired) |
 |---------|------|-------------------|---------------------|
-| postgres | 40/40 | 0/40 | 40/40 |
+| postgres | 40/40 | 40/40 | 40/40 |
 | typedb | 40/40 | 40/40 | 40/40 |
 
 ---

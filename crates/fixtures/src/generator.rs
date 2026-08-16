@@ -733,7 +733,7 @@ fn clone_event_with_variation(
             role: *role,
             jurisdiction: jurisdiction.clone(),
             provenance: Provenance {
-                source_id: provenance.source_id.clone(),
+                source_id: format!("{}/v{}", provenance.source_id, rng.gen::<u32>()),
                 source_authority: provenance.source_authority,
                 observed_at: provenance.observed_at + Duration::hours(rng.gen_range(1..48)),
             },
@@ -862,6 +862,59 @@ mod tests {
         use benchmark_core::{AssertionId, Bitemporal, Event};
 
         let bundle = generate_fixtures(42, Scale::S);
+        let mut seen = HashSet::new();
+
+        for event in &bundle.events {
+            match event {
+                Event::AssertOwnership {
+                    owner,
+                    owned,
+                    share_pct,
+                    bitemporal,
+                    provenance,
+                    ..
+                } => {
+                    let predicate = format!("owns_{share_pct}");
+                    let id = AssertionId::deterministic(
+                        owner.entity(),
+                        &predicate,
+                        owned.entity(),
+                        bitemporal,
+                        0,
+                        &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                    );
+                    assert!(seen.insert(id), "duplicate ownership id {:?}", id.0);
+                }
+                Event::LateArrival {
+                    subject,
+                    predicate,
+                    object,
+                    bitemporal,
+                    provenance,
+                    ..
+                } if predicate.starts_with("owns_") => {
+                    let id = AssertionId::deterministic(
+                        *subject,
+                        predicate,
+                        *object,
+                        bitemporal,
+                        1,
+                        &format!("{}@{}", provenance.source_id, provenance.observed_at.timestamp()),
+                    );
+                    assert!(seen.insert(id), "duplicate late ownership id {:?}", id.0);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn postgres_bound_assertion_ids_are_unique_m() {
+        use std::collections::HashSet;
+
+        use benchmark_core::{AssertionId, Event};
+
+        let bundle = generate_fixtures(42, Scale::M);
         let mut seen = HashSet::new();
 
         for event in &bundle.events {
