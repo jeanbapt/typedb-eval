@@ -12,7 +12,7 @@ pub struct SignalReport {
 pub struct SchemaEvolutionSignal {
     /// Backends whose frozen Q9 lost recall after the ontology was extended.
     pub lost_recall: Vec<(String, f64, u64)>,
-    /// Backends whose frozen Q9 kept full recall with no query edit.
+    /// Backends whose frozen Q9 kept (or improved) their base recall with no query edit.
     pub held_recall: Vec<String>,
 }
 
@@ -148,7 +148,7 @@ pub fn detect_signal_with(
         for (backend, recall, repair_loc) in &se.lost_recall {
             let line = format!(
                 "Schema evolution: {backend} silently drops to {:.1}% recall after an ontology \
-                 extension and needs {repair_loc} LOC of query repair",
+                 extension ({repair_loc} LOC of query repair)",
                 recall * 100.0
             );
             if backend == "postgres" {
