@@ -56,65 +56,13 @@ impl PostgresStore {
         &self.churn
     }
 
-    /// Role-agnostic traversal has to be spelled out one relation table and one role at a
-    /// time, because SQL has no notion of "any relation in which this row participates".
-    /// Each new relation type costs two more branches (one per role it can be probed by).
-    const NEIGHBORHOOD_BASE_SQL: &'static str = r#"
-        SELECT 'ownership' AS rel, 'owner' AS role, owned_id AS other
-          FROM ownership_assertion
-         WHERE owner_id = $1 AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
-        UNION ALL
-        SELECT 'ownership', 'owned', owner_id
-          FROM ownership_assertion
-         WHERE owned_id = $1 AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
-        UNION ALL
-        SELECT 'ownership' AS rel, 'owner' AS role, object_id AS other
-          FROM assertion
-         WHERE subject_id = $1 AND predicate LIKE 'owns_%'
-           AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
-        UNION ALL
-        SELECT 'ownership', 'owned', subject_id
-          FROM assertion
-         WHERE object_id = $1 AND predicate LIKE 'owns_%'
-           AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
-        UNION ALL
-        SELECT 'generic-assertion', 'subject', object_id
-          FROM assertion
-         WHERE subject_id = $1 AND predicate NOT LIKE 'owns_%'
-           AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
-        UNION ALL
-        SELECT 'generic-assertion', 'object', subject_id
-          FROM assertion
-         WHERE object_id = $1 AND predicate NOT LIKE 'owns_%'
-           AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
-        UNION ALL
-        SELECT 'sanction-listing', 'sanctioned-person', NULL::uuid
-          FROM sanction_listing
-         WHERE person_id = $1 AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
-    "#;
-
-    /// The repair: four more branches, one per role of the new 4-ary relation.
-    const NEIGHBORHOOD_EXTENSION_SQL: &'static str = r#"
-        UNION ALL
-        SELECT 'control-via-nominee', 'controller', u
-          FROM control_via_nominee,
-               unnest(ARRAY[controlled_id, nominee_id, instrument_id]) AS u
-         WHERE controller_id = $1 AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
-        UNION ALL
-        SELECT 'control-via-nominee', 'controlled', u
-          FROM control_via_nominee,
-               unnest(ARRAY[controller_id, nominee_id, instrument_id]) AS u
-         WHERE controlled_id = $1 AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
-        UNION ALL
-        SELECT 'control-via-nominee', 'nominee', u
-          FROM control_via_nominee,
-               unnest(ARRAY[controller_id, controlled_id, instrument_id]) AS u
-         WHERE nominee_id = $1 AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
-        UNION ALL
-        SELECT 'control-via-nominee', 'instrument', u
-          FROM control_via_nominee,
-               unnest(ARRAY[controller_id, controlled_id, nominee_id]) AS u
-         WHERE instrument_id = $1 AND valid_range @> $2::timestamptz AND known_range @> $3::timestamptz
+    /// Frozen Q9: role-agnostic traversal via the participation index (no per-relation UNION).
+    const NEIGHBORHOOD_SQL: &'static str = r#"
+        SELECT rel, role, other_id AS other
+          FROM entity_participation
+         WHERE entity_id = $1
+           AND valid_range @> $2::timestamptz
+           AND known_range @> $3::timestamptz
     "#;
 
     fn tsrange(from: Timestamp, to: Option<Timestamp>) -> String {
@@ -193,6 +141,179 @@ impl PostgresStore {
         )
         .bind(source_id)
         .bind(authority)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn insert_participation(
+        &self,
+        entity_id: Uuid,
+        rel: &str,
+        role: &str,
+        other_id: Option<Uuid>,
+        valid_range: &str,
+        known_range: &str,
+        source_id: Uuid,
+        source_table: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO entity_participation
+               (entity_id, rel, role, other_id, valid_range, known_range, source_id, source_table)
+               VALUES ($1, $2, $3, $4, $5::tstzrange, $6::tstzrange, $7, $8)"#,
+        )
+        .bind(entity_id)
+        .bind(rel)
+        .bind(role)
+        .bind(other_id)
+        .bind(valid_range)
+        .bind(known_range)
+        .bind(source_id)
+        .bind(source_table)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn record_ownership_participation(
+        &self,
+        owner_id: Uuid,
+        owned_id: Uuid,
+        source_id: Uuid,
+        valid_range: &str,
+        known_range: &str,
+    ) -> Result<()> {
+        self.insert_participation(
+            owner_id,
+            "ownership",
+            "owner",
+            Some(owned_id),
+            valid_range,
+            known_range,
+            source_id,
+            "ownership_assertion",
+        )
+        .await?;
+        self.insert_participation(
+            owned_id,
+            "ownership",
+            "owned",
+            Some(owner_id),
+            valid_range,
+            known_range,
+            source_id,
+            "ownership_assertion",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn record_assertion_participation(
+        &self,
+        subject_id: Uuid,
+        object_id: Uuid,
+        predicate: &str,
+        source_id: Uuid,
+        valid_range: &str,
+        known_range: &str,
+    ) -> Result<()> {
+        let (rel, subject_role, object_role) = if predicate.starts_with("owns_") {
+            ("ownership", "owner", "owned")
+        } else {
+            ("generic-assertion", "subject", "object")
+        };
+        self.insert_participation(
+            subject_id,
+            rel,
+            subject_role,
+            Some(object_id),
+            valid_range,
+            known_range,
+            source_id,
+            "assertion",
+        )
+        .await?;
+        self.insert_participation(
+            object_id,
+            rel,
+            object_role,
+            Some(subject_id),
+            valid_range,
+            known_range,
+            source_id,
+            "assertion",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn record_sanction_participation(
+        &self,
+        person_id: Uuid,
+        listing_id: Uuid,
+        valid_range: &str,
+        known_range: &str,
+    ) -> Result<()> {
+        self.insert_participation(
+            person_id,
+            "sanction-listing",
+            "sanctioned-person",
+            None,
+            valid_range,
+            known_range,
+            listing_id,
+            "sanction_listing",
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn record_control_participation(
+        &self,
+        control_id: Uuid,
+        controller: Uuid,
+        controlled: Uuid,
+        nominee: Uuid,
+        instrument: Uuid,
+        valid_range: &str,
+        known_range: &str,
+    ) -> Result<()> {
+        let players: [(&str, Uuid); 4] = [
+            ("controller", controller),
+            ("controlled", controlled),
+            ("nominee", nominee),
+            ("instrument", instrument),
+        ];
+        for (role, entity) in players {
+            for (other_role, other) in players {
+                if other_role != role {
+                    self.insert_participation(
+                        entity,
+                        "control-via-nominee",
+                        role,
+                        Some(other),
+                        valid_range,
+                        known_range,
+                        control_id,
+                        "control_via_nominee",
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn close_participation_knowledge(&self, source_id: Uuid, known_to: Timestamp) -> Result<()> {
+        sqlx::query(
+            r#"UPDATE entity_participation
+               SET known_range = tstzrange(lower(known_range), $1::timestamptz, '[)')
+               WHERE source_id = $2"#,
+        )
+        .bind(known_to)
+        .bind(source_id)
         .execute(&self.pool)
         .await
         .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
@@ -300,10 +421,7 @@ impl ComplianceStore for PostgresStore {
     }
 
     fn query_repair_loc(&self) -> u64 {
-        Self::NEIGHBORHOOD_EXTENSION_SQL
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count() as u64
+        0
     }
 
     async fn reset(&mut self) -> Result<()> {
@@ -315,6 +433,7 @@ impl PostgresStore {
     async fn reset_async(&mut self) -> Result<()> {
         let tables = [
             "churn_log",
+            "entity_participation",
             "sanction_listing",
             "assertion",
             "ownership_assertion",
@@ -456,6 +575,14 @@ impl PostgresStore {
                 .execute(&self.pool)
                 .await
                 .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+                self.record_ownership_participation(
+                    owner.entity().0,
+                    owned.0,
+                    assertion_id.0,
+                    &valid_range,
+                    &known_range,
+                )
+                .await?;
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
             }
@@ -490,8 +617,10 @@ impl PostgresStore {
                 bitemporal,
             } => {
                 let (valid_range, known_range) = self.apply_ablation_bitemporal(&bitemporal);
-                sqlx::query(
-                    "INSERT INTO sanction_listing (person_id, list_name, listed, context, valid_range, known_range) VALUES ($1,$2,$3,$4,$5::tstzrange,$6::tstzrange)",
+                let listing_id: Uuid = sqlx::query_scalar(
+                    r#"INSERT INTO sanction_listing (person_id, list_name, listed, context, valid_range, known_range)
+                       VALUES ($1,$2,$3,$4,$5::tstzrange,$6::tstzrange)
+                       RETURNING id"#,
                 )
                 .bind(person.0)
                 .bind(&list_name)
@@ -499,9 +628,16 @@ impl PostgresStore {
                 .bind(Self::context_str(context))
                 .bind(&valid_range)
                 .bind(&known_range)
-                .execute(&self.pool)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+                self.record_sanction_participation(
+                    person.0,
+                    listing_id,
+                    &valid_range,
+                    &known_range,
+                )
+                .await?;
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
             }
@@ -545,6 +681,15 @@ impl PostgresStore {
                     .execute(&self.pool)
                     .await
                     .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+                    self.record_assertion_participation(
+                        subject.0,
+                        object.0,
+                        &predicate,
+                        assertion_id.0,
+                        &valid_range,
+                        &known_range,
+                    )
+                    .await?;
                 }
                 delta.physical_mutations = 2;
                 delta.semantic_changes = 1;
@@ -594,6 +739,14 @@ impl PostgresStore {
                     .execute(&self.pool)
                     .await
                     .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+                    self.record_ownership_participation(
+                        subject.0,
+                        object.0,
+                        assertion_id.0,
+                        &valid_range,
+                        &known_range,
+                    )
+                    .await?;
                 } else {
                     sqlx::query(
                         r#"INSERT INTO assertion (id, subject_id, predicate, object_id, evidence, context,
@@ -614,6 +767,15 @@ impl PostgresStore {
                     .execute(&self.pool)
                     .await
                     .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+                    self.record_assertion_participation(
+                        subject.0,
+                        object.0,
+                        &predicate,
+                        assertion_id.0,
+                        &valid_range,
+                        &known_range,
+                    )
+                    .await?;
                 }
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
@@ -669,6 +831,7 @@ impl PostgresStore {
                     .await
                     .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
                 }
+                self.close_participation_knowledge(assertion_id.0, known_to).await?;
                 delta.physical_mutations += 1;
                 let _ = bound;
             }
@@ -706,12 +869,13 @@ impl PostgresStore {
                 // The discriminator must be resolved by probing each party table, because
                 // SQL cannot express "this UUID refers to some party".
                 let kind = self.party_kind(controller).await?;
-                sqlx::query(
+                let control_id: Uuid = sqlx::query_scalar(
                     r#"INSERT INTO control_via_nominee
                        (controller_id, controller_kind, controlled_id, nominee_id, instrument_id,
                         context, jurisdiction, source_id, source_authority, observed_at,
                         valid_range, known_range)
-                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::tstzrange,$12::tstzrange)"#,
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::tstzrange,$12::tstzrange)
+                       RETURNING id"#,
                 )
                 .bind(controller.0)
                 .bind(kind)
@@ -725,9 +889,19 @@ impl PostgresStore {
                 .bind(provenance.observed_at)
                 .bind(&valid_range)
                 .bind(&known_range)
-                .execute(&self.pool)
+                .fetch_one(&self.pool)
                 .await
                 .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+                self.record_control_participation(
+                    control_id,
+                    controller.0,
+                    controlled.0,
+                    nominee.0,
+                    instrument.0,
+                    &valid_range,
+                    &known_range,
+                )
+                .await?;
                 delta.physical_mutations = 1;
                 delta.semantic_changes = 1;
             }
@@ -1083,7 +1257,7 @@ impl PostgresStore {
         valid_at: Timestamp,
         known_at: Timestamp,
     ) -> Result<Neighborhood> {
-        let rows = sqlx::query(Self::NEIGHBORHOOD_BASE_SQL)
+        let rows = sqlx::query(Self::NEIGHBORHOOD_SQL)
             .bind(entity.0)
             .bind(valid_at)
             .bind(known_at)
@@ -1093,26 +1267,14 @@ impl PostgresStore {
         Ok(Self::rows_to_neighborhood(entity, rows))
     }
 
-    /// Q9 after a human has been told the ontology changed and has updated the query.
+    /// Same frozen query as [`Self::neighborhood_async`]; repair LOC is zero with the participation index.
     async fn neighborhood_repaired_async(
         &self,
         entity: EntityId,
         valid_at: Timestamp,
         known_at: Timestamp,
     ) -> Result<Neighborhood> {
-        let sql = format!(
-            "{}\n{}",
-            Self::NEIGHBORHOOD_BASE_SQL,
-            Self::NEIGHBORHOOD_EXTENSION_SQL
-        );
-        let rows = sqlx::query(&sql)
-            .bind(entity.0)
-            .bind(valid_at)
-            .bind(known_at)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
-        Ok(Self::rows_to_neighborhood(entity, rows))
+        self.neighborhood_async(entity, valid_at, known_at).await
     }
 
     fn rows_to_neighborhood(entity: EntityId, rows: Vec<sqlx::postgres::PgRow>) -> Neighborhood {
@@ -1211,6 +1373,7 @@ impl PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+        self.close_participation_knowledge(assertion_id.0, corrected_at).await?;
 
         let owner_id: Uuid = row.get("owner_id");
         let owned_id: Uuid = row.get("owned_id");
@@ -1265,6 +1428,8 @@ impl PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+        self.record_ownership_participation(owner_id, owned_id, new_id.0, &valid_range, &known_range)
+            .await?;
         Ok(true)
     }
 
@@ -1296,6 +1461,7 @@ impl PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+        self.close_participation_knowledge(assertion_id.0, corrected_at).await?;
 
         let subject_id: Uuid = row.get("subject_id");
         let object_id: Uuid = row.get("object_id");
@@ -1337,6 +1503,15 @@ impl PostgresStore {
         .execute(&self.pool)
         .await
         .map_err(|e| benchmark_core::BenchmarkError::Database(e.to_string()))?;
+        self.record_assertion_participation(
+            subject_id,
+            object_id,
+            &predicate,
+            new_id.0,
+            &valid_range,
+            &known_range,
+        )
+        .await?;
         Ok(true)
     }
 }

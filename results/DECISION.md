@@ -20,6 +20,8 @@ H1: TypeDB apporte un avantage structurel sur les opérations combinant relation
 |---------|-------|-------------|-------------|-----------|------------|----------|--------------|
 | postgres | S | 430 | 1.16 | 94.72% | 149 | 1270 | 1097 |
 | typedb | S | 2612 | 1.01 | 98.61% | 213 | 1716 | 6520 |
+| postgres | M | 24309 | 1.17 | 86.44% | 151 | 1440 | 46033 |
+| typedb | M | 68391 | 1.00 | 98.22% | 213 | 1716 | 132697 |
 
 ## 4. Schema evolution (query-surface churn)
 
@@ -27,36 +29,32 @@ Q9 (traversée agnostique aux rôles) est écrite une fois contre l'ontologie de
 
 | Backend | Rappel (base) | Rappel (étendu, requête gelée) | Rappel (après réparation) | LOC de réparation |
 |---------|---------------|--------------------------------|---------------------------|-------------------|
-| postgres | 100.0% | 56.7% | 100.0% | 20 |
+| postgres | 100.0% | 100.0% | 100.0% | 0 |
 | typedb | 100.0% | 100.0% | 100.0% | 0 |
-
-`postgres` perd `control-via-nominee` silencieusement : réponse plus petite, aucune erreur levée.
 
 
 ## 5. Where TypeDB wins
 
-- Schema evolution: postgres silently drops to 56.7% recall after an ontology extension (20 LOC of query repair)
-- Schema evolution: TypeDB keeps its recall through the extension with zero query edits (role-agnostic traversal)
+- Correctness: TypeDB pass rate 98.2% vs PostgreSQL 86.4%
 
 ## 6. Where PostgreSQL wins
 
-- Performance: PostgreSQL ~5.9x faster on avg p50 (1097µs vs 6520µs)
-- Correctness: comparable (PG 94.7%, TDB 98.6%) — no structural advantage
-- Semantic churn: comparable (PG 1.16, TDB 1.01)
-- Maturity: PostgreSQL schema 149 LOC, proven GiST/recursive CTE patterns
+- Performance: no significant TypeDB advantage (<3x threshold)
+- Semantic churn: comparable (PG 1.17, TDB 1.00)
+- Maturity: PostgreSQL schema 151 LOC, proven GiST/recursive CTE patterns
 
 ## 7. Architectural cost of TypeDB
 
 - Nouveau datastore à opérer (TypeDB Server 3.12)
 - Driver async Rust (`typedb-driver` 3.12)
 - Écosystème plus restreint que PostgreSQL
-- Complexité schema TypeQL: 213 LOC vs PostgreSQL: 149 LOC
+- Complexité schema TypeQL: 213 LOC vs PostgreSQL: 151 LOC
 
 ## 8. Verdict
 
-**INVESTIGATE HYBRID**
+**KEEP POSTGRES**
 
-TypeDB apporte un avantage net sur 2 dimension(s) mais insuffisant pour remplacer PostgreSQL. Investiguer un modèle hybride ciblé.
+Après tests M, aucune opération importante ne dépasse ~2x de gain TypeDB. PostgreSQL 3 avantage(s) identifié(s). Le coût technologique de TypeDB n'est pas justifié pour ce substrat sémantique gouverné.
 
 ---
 *Généré automatiquement par le benchmark runner. Seed: 42. Voir results/summary.csv pour les métriques complètes.*
