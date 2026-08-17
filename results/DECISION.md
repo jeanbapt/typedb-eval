@@ -18,8 +18,8 @@ H1: TypeDB apporte un avantage structurel sur les opérations combinant relation
 
 | Backend | Scale | Ingest (ms) | Churn ratio | Pass rate | Schema LOC | Rust LOC | Avg p50 (µs) |
 |---------|-------|-------------|-------------|-----------|------------|----------|--------------|
-| postgres | S | 430 | 1.16 | 94.72% | 149 | 1270 | 1097 |
-| typedb | S | 2612 | 1.01 | 98.61% | 213 | 1716 | 6520 |
+| postgres | S | 1305 | 1.15 | 93.61% | 151 | 1440 | 1391 |
+| typedb | S | 3245 | 1.01 | 98.33% | 213 | 1716 | 7164 |
 | postgres | M | 24309 | 1.17 | 86.44% | 151 | 1440 | 46033 |
 | typedb | M | 68391 | 1.00 | 98.22% | 213 | 1716 | 132697 |
 

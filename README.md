@@ -245,8 +245,8 @@ After TypeDB backend optimizations (server-side recursion, bitemporal pushdown, 
 
 | Backend | Pass rate | Ingest | Churn | Avg p50 | Missed relations | False allow/block |
 |---------|-----------|--------|-------|---------|------------------|-------------------|
-| **PostgreSQL** | 94.7% | 0.4 s | 1.16 | 1.1 ms | 0 | 0 |
-| **TypeDB** | **98.6%** | 2.6 s | 1.01 | 6.5 ms | 0 | 0 |
+| **PostgreSQL** | 93.6% | 1.3 s | 1.15 | 1.4 ms | 0 | 0 |
+| **TypeDB** | **98.3%** | 3.2 s | 1.01 | 7.2 ms | 0 | 0 |
 
 ### Scale M (~20k events, cold)
 
@@ -272,7 +272,7 @@ This benchmark’s verdict is **KEEP POSTGRES** for the operational store at sca
 | Signal | TypeDB | PostgreSQL | Why it matters |
 |--------|--------|------------|----------------|
 | **Pass rate (M)** | **98.2%** | 86.4% | Oracle alignment on hard semantic queries, not safety (both: 0 false allow/block) |
-| **Pass rate (S)** | **98.6%** | 94.7% | Same pattern at smaller scale |
+| **Pass rate (S)** | **98.3%** | 93.6% | Same pattern at smaller scale |
 | **Q7 / Q8** | Near-oracle | Mostly `incorrect_historical_replay` at M | Bitemporal **decision replay** and **retrospective classification** |
 | **Semantic churn** | **1.00** | 1.17 | Fewer physical mutations per semantic change |
 | **Schema evolution (Q9)** | 100% recall, 0 repair LOC | 100% recall, 0 repair LOC (after participation index) | Parity after Postgres fix — no longer a TypeDB-only win |
@@ -289,7 +289,7 @@ These are the PERA properties that originally motivated the trial — several st
 4. **Server-side recursion** — transitive ownership in `schema.tql` functions with bitemporal `given` parameters, shared across Q1/Q5/Q7/Q8/Q9 instead of duplicated recursive CTE strings.
 5. **Typed invariants** — which entity types may play which roles in which relation is schema-enforced, not convention in Rust.
 
-TypeDB does **not** shine here on **latency** (~2.9× slower avg p50 at M, ~6× at S), **operational maturity**, or **agent MCP ergonomics** (both backends are equally awkward for NL retrieval until the agent learns the schema).
+TypeDB does **not** shine here on **latency** (~2.9× slower avg p50 at M, ~5.2× at S), **operational maturity**, or **agent MCP ergonomics** (both backends are equally awkward for NL retrieval until the agent learns the schema).
 
 ### Implications for SGRS and an open swarm of governed agents
 
@@ -354,7 +354,7 @@ This benchmark does **not** show that TypeDB is bad at managing time. Early fail
 
 1. **Ergonomics** — even with schema functions and server-side filters, combining recursion, polymorphism, and bitemporal constraints in TypeQL is more verbose than a Postgres recursive CTE with `tstzrange @> timestamptz`.
 2. **Pushdown** — Postgres filters intervals via GiST in SQL; the TypeDB backend now pushes bitemporal bounds into TypeQL, but interval indexing semantics still differ from native `tstzrange`.
-3. **Performance** — ~6× slower avg p50 on scale S (~2.9× on scale M) after backend optimizations (down from ~73× on S before server-side recursion and query parameterization).
+3. **Performance** — ~5.2× slower avg p50 on scale S (~2.9× on scale M) after backend optimizations (down from ~73× on S before server-side recursion and query parameterization).
 
 In short: TypeDB's **model** supports the bitemporality SGRS requires (Q7/Q8 pass). The **cost** is mostly latency and query ergonomics, not broken temporal semantics.
 
